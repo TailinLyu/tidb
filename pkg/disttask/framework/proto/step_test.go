@@ -41,6 +41,12 @@ func TestStep(t *testing.T) {
 	require.Equal(t, "done", Step2Str(ImportInto, StepDone))
 	require.Equal(t, "unknown step 123", Step2Str(ImportInto, 123))
 
+	// non-transactional DML
+	require.Equal(t, "init", Step2Str(NonTransactionalDML, StepInit))
+	require.Equal(t, "run", Step2Str(NonTransactionalDML, NonTransactionalDMLStepRun))
+	require.Equal(t, "done", Step2Str(NonTransactionalDML, StepDone))
+	require.Equal(t, "unknown step 234", Step2Str(NonTransactionalDML, 234))
+
 	// example type
 	require.Equal(t, "init", Step2Str(TaskTypeExample, StepInit))
 	require.Equal(t, "one", Step2Str(TaskTypeExample, StepOne))

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/disttask/framework/testutil"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/prometheus/client_golang/prometheus"
@@ -462,6 +463,42 @@ func TestNonTransactionalDMLRangeModeRetriesChunkBeforeCommit(t *testing.T) {
 	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows("1 2", "2 3", "3 4"))
 	tk.MustQuery("select status, count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't' group by status").
 		Check(testkit.Rows("done 1"))
+}
+
+func TestNonTransactionalDMLDXFModeDeleteAndUpdate(t *testing.T) {
+	c := testutil.NewTestDXFContext(t, 0, 16, true)
+	// Keep test DXF exec IDs separate from the domain dist-task manager's test ID.
+	c.ScaleOutBy(":5100", true)
+	c.ScaleOutBy(":5101", false)
+	tk := testkit.NewTestKit(t, c.Store)
+
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='dxf'")
+	tk.MustExec("set @@tidb_nontransactional_dml_concurrency=2")
+	tk.MustExec("create table t(a int primary key clustered, b int)")
+	for i := 1; i <= 9; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
+	}
+
+	tk.MustQuery("batch on a limit 2 update t set b = b + 10 where a <= 6").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
+		"1 11", "2 12", "3 13", "4 14", "5 15", "6 16", "7 7", "8 8", "9 9",
+	))
+
+	tk.MustQuery("batch on a limit 3 delete from t where b >= 13").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
+		"1 11", "2 12", "7 7", "8 8", "9 9",
+	))
+
+	tk.MustQuery(`select count(*) from (
+		select type, state from mysql.tidb_global_task
+		union all
+		select type, state from mysql.tidb_global_task_history
+	) tasks where type = 'NonTransactionalDML' and state = 'succeed'`).Check(testkit.Rows("2"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't' and status = 'done'").
+		Check(testkit.Rows("4"))
 }
 
 func TestNonTransactionalDMLWorkWithForeignKey(t *testing.T) {

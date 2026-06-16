@@ -101,15 +101,18 @@ Before parser support for `CONCURRENCY` lands, the same mode can be enabled with
 SET @@tidb_nontransactional_dml_execution_mode = 'range';
 SET @@tidb_nontransactional_dml_concurrency = 8;
 BATCH ON id LIMIT 10000 DELETE FROM t WHERE status = 'expired';
+
+SET @@tidb_nontransactional_dml_execution_mode = 'dxf';
+BATCH ON id LIMIT 10000 UPDATE t SET archived = 1 WHERE status = 'expired';
 ```
 
 The semantics are:
 
 * `LIMIT batch_size` is the target maximum number of handles scanned per mutation chunk. Because the mutation rechecks the original predicate over the scanned handle interval, concurrent changes can make the affected row count differ from the scanned handle count.
-* `CONCURRENCY concurrency` is the maximum number of range workers or distributed subtasks.
-* If the user does not explicitly select the range executor, existing serial behavior is preserved.
-* If the range executor is explicitly selected and the statement shape is unsupported, TiDB returns an error instead of silently changing semantics.
-* If the range executor is not explicitly selected and the statement shape is unsupported by the range executor, TiDB continues to use the existing serial executor.
+* `CONCURRENCY concurrency` is the maximum number of local range workers or DXF distributed subtasks.
+* If the user does not explicitly select the range/DXF executor, existing serial behavior is preserved.
+* If the range/DXF executor is explicitly selected and the statement shape is unsupported, TiDB returns an error instead of silently changing semantics.
+* If the range/DXF executor is not explicitly selected and the statement shape is unsupported by the range executor, TiDB continues to use the existing serial executor.
 
 ## P1 Scope
 
@@ -311,19 +314,25 @@ If the mutation transaction returns an ambiguous commit result, the retry path f
 
 The DXF task is responsible for ownership, scheduling, failover, and task history. The non-transactional DML executor is responsible for SQL-specific planning, checkpoint persistence, statement construction, and retry classification.
 
-The DXF subtask meta contains immutable range identity and executable task metadata references. It does not serve as the only progress checkpoint. Live progress is persisted in the checkpoint table after every committed chunk. DXF integration must also add stable job identity and startup checkpoint loading so a replacement owner can resume from `(checkpoint, range_end)`.
+The DXF subtask meta contains immutable range identity and executable task metadata references. It does not serve as the only progress checkpoint. Live progress is persisted in the checkpoint table after every committed chunk. The task meta stores both executable DML text and redacted display DML text, plus current database and captured session variables needed by worker sessions.
 
-The initial task type can be named `NonTransactionalDML` and have one execution step:
+The initial task type is `NonTransactionalDML` and has one execution step:
 
 ```text
-StepExecuteRanges
+NonTransactionalDMLStepRun
 ```
+
+The first DXF implementation splits the signed handle interval from `MIN(handle)` to `MAX(handle)` into up to `tidb_nontransactional_dml_concurrency` coarse `(start, end]` subtasks. Each subtask then runs the same bounded chunk scan/mutate loop as the local range executor with the user's `LIMIT` as the per-transaction scan target. This avoids materializing every chunk before execution. Region, statistics, and adaptive split planning remain later phases.
+
+When a DXF subtask starts or restarts, it loads `(checkpoint, range_end)` from `mysql.tidb_nontransactional_dml_checkpoint`. A `done` checkpoint advances the exclusive lower bound and carries cumulative scanned/affected counters. A `failed` checkpoint fails the subtask for user inspection rather than guessing whether a non-idempotent update should be replayed.
+
+If the DXF task manager is not initialized, explicit `dxf` mode falls back to the local range executor. If DXF is initialized, execution uses DXF and task failures are surfaced through DXF task state.
 
 ### Local Fallback
 
 The local executor uses the same range planner, chunk scan/mutate loop, and checkpoint table. It runs on the current TiDB node and can use multiple internal sessions capped by `tidb_nontransactional_dml_concurrency`.
 
-This local path is P1. DXF uses the same executor logic later with distributed ownership, stable job identity, checkpoint loading, and failover.
+This local path is P1. DXF uses the same executor logic with distributed ownership, stable job identity, checkpoint loading, and task history.
 
 ### Failure Handling and Retry
 
@@ -339,10 +348,12 @@ Retryable errors before commit result is known are retried with bounded exponent
 
 For ambiguous commit results, TiDB reads the durable checkpoint row before retrying. If the checkpoint advanced for the active job, TiDB skips to the next chunk. If the checkpoint did not advance, TiDB reports the ambiguous outcome instead of blindly replaying a possibly committed non-idempotent update. Full worker-crash and DXF-failover resume is a Phase 2 requirement.
 
-The existing `tidb_nontransactional_ignore_error` behavior is preserved at chunk level:
+The existing `tidb_nontransactional_ignore_error` behavior is preserved at chunk level by the serial and local range executors:
 
 * if disabled, the first permanent chunk error fails the task;
 * if enabled, TiDB records the failed range or chunk and continues with other ranges where possible.
+
+DXF v1 rejects `tidb_nontransactional_ignore_error=ON`. Supporting it safely needs a separate per-failed-chunk record, because a resumable DXF range currently stores one advancing checkpoint row per range.
 
 ### Progress and Observability
 
@@ -453,6 +464,16 @@ Implement P1 scope: local handle-range planning, chunk scan/mutate execution, ex
 ### Phase 2: DXF Distributed Executor
 
 Add a `NonTransactionalDML` DXF task type. Use DXF for range subtasks, task ownership, failover, progress summaries, and task history. Keep the checkpoint table as the source of resumable progress.
+
+Initial implementation status:
+
+* `tidb_nontransactional_dml_execution_mode = 'dxf'` selects DXF explicitly.
+* `NonTransactionalDML` task type and `NonTransactionalDMLStepRun` are registered with DXF.
+* the scheduler creates coarse signed-handle `(start, end]` range subtasks without enumerating every mutation chunk;
+* each subtask loads the durable checkpoint and resumes from `(checkpoint, range_end)`;
+* the statement waits synchronously for the DXF task and returns the existing non-transactional DML result shape;
+* local range fallback is used when DXF is not initialized;
+* `tidb_nontransactional_ignore_error=ON` is rejected in DXF mode until failed-chunk history is represented separately.
 
 ### Phase 3: Composite and Common Handles
 

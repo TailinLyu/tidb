@@ -2726,7 +2726,7 @@ var defaultSysVars = []*SysVar{
 		},
 	},
 	{Scope: ScopeGlobal | ScopeSession, Name: TiDBNonTransactionalDMLExecutionMode, Value: DefTiDBNonTransactionalDMLExecutionMode, Type: TypeEnum,
-		PossibleValues: []string{"serial", "range"},
+		PossibleValues: []string{"serial", "range", "dxf"},
 		SetSession: func(s *SessionVars, val string) error {
 			s.NonTransactionalDMLExecutionMode = strings.ToLower(val)
 			return nil

@@ -522,6 +522,9 @@ func TestSubTaskTable(t *testing.T) {
 	time.Sleep(time.Second)
 	require.NoError(t, sm.StartSubtask(ctx, 1, "tidb1"))
 
+	err = sm.StartSubtask(ctx, 1, "tidb1")
+	require.ErrorIs(t, err, storage.ErrSubtaskNotFound)
+
 	err = sm.StartSubtask(ctx, 1, "tidb2")
 	require.ErrorIs(t, err, storage.ErrSubtaskNotFound)
 

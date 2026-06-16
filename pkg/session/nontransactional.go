@@ -59,12 +59,13 @@ var ErrNonTransactionalJobFailure = dbterror.ClassSession.NewStd(errno.ErrNonTra
 
 // job: handle keys in [start, end]
 type job struct {
-	start   types.Datum
-	end     types.Datum
-	err     error
-	jobID   int
-	jobSize int // it can be inaccurate if there are concurrent writes
-	sql     string
+	start    types.Datum
+	end      types.Datum
+	err      error
+	jobID    int
+	jobSize  int // it can be inaccurate if there are concurrent writes
+	sql      string
+	affected uint64
 }
 
 // statementBuildInfo contains information that is needed to build the split statement in a job
@@ -103,7 +104,7 @@ func HandleNonTransactionalDML(ctx context.Context, stmt *ast.NonTransactionalDM
 	if err := checkConstraint(stmt, se); err != nil {
 		return nil, err
 	}
-	if sessVars.NonTransactionalDMLExecutionMode == "range" {
+	if isNonTransactionalDMLRangeExecutionMode(sessVars.NonTransactionalDMLExecutionMode) {
 		if err := checkRangeModeStatementShape(stmt); err != nil {
 			return nil, err
 		}
@@ -118,8 +119,11 @@ func HandleNonTransactionalDML(ctx context.Context, stmt *ast.NonTransactionalDM
 		return nil, err
 	}
 
-	if sessVars.NonTransactionalDMLExecutionMode == "range" {
+	switch sessVars.NonTransactionalDMLExecutionMode {
+	case "range":
 		return handleNonTransactionalDMLByRange(ctx, stmt, se, nodeW.GetResolveContext(), tableName, shardColumnInfo, tableSources)
+	case "dxf":
+		return handleNonTransactionalDMLByDXF(ctx, stmt, se, nodeW.GetResolveContext(), tableName, shardColumnInfo, tableSources)
 	}
 
 	if stmt.DryRun == ast.DryRunQuery {
@@ -146,6 +150,10 @@ func HandleNonTransactionalDML(ctx context.Context, stmt *ast.NonTransactionalDM
 		return buildDryRunResults(stmt.DryRun, splitStmts, se.GetSessionVars().BatchSize.MaxChunkSize)
 	}
 	return buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+}
+
+func isNonTransactionalDMLRangeExecutionMode(mode string) bool {
+	return mode == "range" || mode == "dxf"
 }
 
 func checkRangeModeStatementShape(stmt *ast.NonTransactionalDMLStmt) error {
@@ -496,12 +504,14 @@ type nonTransactionalDMLRangeContext struct {
 }
 
 type nonTransactionalDMLRangeChunk struct {
-	jobID   string
-	rangeID int64
-	start   *int64
-	end     int64
-	size    int
-	sql     string
+	jobID          string
+	rangeID        int64
+	start          *int64
+	end            int64
+	size           int
+	scannedBefore  uint64
+	affectedBefore uint64
+	sql            string
 }
 
 const (
@@ -805,24 +815,8 @@ func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessionty
 	workerVars.ActiveRoles = append(workerVars.ActiveRoles[:0], parentVars.ActiveRoles...)
 	workerVars.SetResourceGroupName(parentVars.ResourceGroupName)
 	workerVars.StmtCtx.ResourceGroupName = parentVars.StmtCtx.ResourceGroupName
-	copyVars := []string{
-		variable.SQLModeVar,
-		variable.TimeZone,
-		variable.CharacterSetConnection,
-		variable.CollationConnection,
-		variable.TiDBRedactLog,
-		variable.ForeignKeyChecks,
-		variable.TiDBForeignKeyCheckInSharedLock,
-		variable.TiDBConstraintCheckInPlace,
-		variable.TiDBConstraintCheckInPlacePessimistic,
-		variable.TiDBEnableMutationChecker,
-	}
-	for _, name := range copyVars {
-		if val, ok := parentVars.GetSystemVar(name); ok {
-			if err := workerVars.SetSystemVar(name, val); err != nil {
-				return err
-			}
-		}
+	if err := applyNonTransactionalDMLWorkerSysVars(workerVars, collectNonTransactionalDMLWorkerSysVars(parentVars)); err != nil {
+		return err
 	}
 	if currentDB == "" {
 		return nil
@@ -830,11 +824,47 @@ func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessionty
 	return executeInternalNoResult(ctx, worker, "USE %n", currentDB)
 }
 
+var nonTransactionalDMLWorkerSysVarNames = []string{
+	variable.SQLModeVar,
+	variable.TimeZone,
+	variable.CharacterSetConnection,
+	variable.CollationConnection,
+	variable.TiDBRedactLog,
+	variable.ForeignKeyChecks,
+	variable.TiDBForeignKeyCheckInSharedLock,
+	variable.TiDBConstraintCheckInPlace,
+	variable.TiDBConstraintCheckInPlacePessimistic,
+	variable.TiDBEnableMutationChecker,
+}
+
+func collectNonTransactionalDMLWorkerSysVars(parentVars *variable.SessionVars) map[string]string {
+	copied := make(map[string]string, len(nonTransactionalDMLWorkerSysVarNames))
+	for _, name := range nonTransactionalDMLWorkerSysVarNames {
+		if val, ok := parentVars.GetSystemVar(name); ok {
+			copied[name] = val
+		}
+	}
+	return copied
+}
+
+func applyNonTransactionalDMLWorkerSysVars(workerVars *variable.SessionVars, sysVars map[string]string) error {
+	for _, name := range nonTransactionalDMLWorkerSysVarNames {
+		val, ok := sysVars[name]
+		if !ok {
+			continue
+		}
+		if err := workerVars.SetSystemVar(name, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func planNonTransactionalDMLRangeChunks(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
 	se sessiontypes.Session, batchSize int, chunkCh chan<- nonTransactionalDMLRangeChunk) error {
 	var start *int64
 	for rangeID := int64(1); ; rangeID++ {
-		handles, err := selectNextNonTransactionalDMLRangeHandles(ctx, rangeCtx, se, start, batchSize)
+		handles, err := selectNextNonTransactionalDMLRangeHandles(ctx, rangeCtx, se, start, nil, batchSize)
 		if err != nil {
 			return err
 		}
@@ -868,12 +898,16 @@ func planNonTransactionalDMLRangeChunks(ctx context.Context, rangeCtx *nonTransa
 }
 
 func selectNextNonTransactionalDMLRangeHandles(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
-	se sessiontypes.Session, start *int64, batchSize int) ([]int64, error) {
+	se sessiontypes.Session, start *int64, end *int64, batchSize int) ([]int64, error) {
 	whereSQL := fmt.Sprintf("(%s)", rangeCtx.originalWhereSQL)
-	args := make([]any, 0, 1)
+	args := make([]any, 0, 2)
 	if start != nil {
 		whereSQL = fmt.Sprintf("%s AND %s > %%?", whereSQL, rangeCtx.handleExprSQL)
 		args = append(args, *start)
+	}
+	if end != nil {
+		whereSQL = fmt.Sprintf("%s AND %s <= %%?", whereSQL, rangeCtx.handleExprSQL)
+		args = append(args, *end)
 	}
 	sql := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d",
 		rangeCtx.handleExprSQL, rangeCtx.fromSQL, whereSQL, rangeCtx.handleExprSQL, batchSize)
@@ -1005,6 +1039,7 @@ func executeNonTransactionalDMLRangeChunk(ctx context.Context, rangeCtx *nonTran
 		return result, isNonTransactionalDMLRangeRetryableError(err)
 	}
 	affectedRows := se.AffectedRows()
+	result.affected = affectedRows
 	if err := writeNonTransactionalDMLRangeCheckpoint(ctx, rangeCtx, se, chunkJob, "done", affectedRows, nil); err != nil {
 		_ = executeInternalNoResult(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, "ROLLBACK")
 		result.err = err
@@ -1050,25 +1085,54 @@ func writeNonTransactionalDMLRangeCheckpoint(ctx context.Context, rangeCtx *nonT
 		rangeCtx.tableName,
 		chunkJob.end,
 		status,
-		chunkJob.size,
-		affectedRows,
+		chunkJob.scannedBefore+uint64(chunkJob.size),
+		chunkJob.affectedBefore+affectedRows,
 		errText,
 	)
 }
 
-func nonTransactionalDMLRangeCheckpointDone(ctx context.Context, se sessiontypes.Session, chunkJob nonTransactionalDMLRangeChunk) (bool, error) {
-	rows, err := sqlexec.ExecSQL(ctx, se, `SELECT checkpoint, status FROM mysql.tidb_nontransactional_dml_checkpoint
+type nonTransactionalDMLRangeCheckpoint struct {
+	checkpoint *int64
+	status     string
+	scanned    uint64
+	affected   uint64
+	errText    string
+}
+
+func loadNonTransactionalDMLRangeCheckpoint(ctx context.Context, se sessiontypes.Session, jobID string, rangeID int64) (nonTransactionalDMLRangeCheckpoint, error) {
+	rows, err := sqlexec.ExecSQL(ctx, se, `SELECT checkpoint, status, scanned, affected, error FROM mysql.tidb_nontransactional_dml_checkpoint
 		WHERE job_id = %? AND range_id = %?`,
-		chunkJob.jobID,
-		chunkJob.rangeID,
+		jobID,
+		rangeID,
 	)
+	if err != nil {
+		return nonTransactionalDMLRangeCheckpoint{}, err
+	}
+	if len(rows) == 0 || rows[0].IsNull(0) {
+		return nonTransactionalDMLRangeCheckpoint{}, nil
+	}
+	checkpoint := rows[0].GetInt64(0)
+	loaded := nonTransactionalDMLRangeCheckpoint{
+		checkpoint: &checkpoint,
+		status:     rows[0].GetString(1),
+		scanned:    rows[0].GetUint64(2),
+		affected:   rows[0].GetUint64(3),
+	}
+	if !rows[0].IsNull(4) {
+		loaded.errText = rows[0].GetString(4)
+	}
+	return loaded, nil
+}
+
+func nonTransactionalDMLRangeCheckpointDone(ctx context.Context, se sessiontypes.Session, chunkJob nonTransactionalDMLRangeChunk) (bool, error) {
+	checkpoint, err := loadNonTransactionalDMLRangeCheckpoint(ctx, se, chunkJob.jobID, chunkJob.rangeID)
 	if err != nil {
 		return false, err
 	}
-	if len(rows) == 0 || rows[0].IsNull(0) {
+	if checkpoint.checkpoint == nil {
 		return false, nil
 	}
-	return rows[0].GetInt64(0) == chunkJob.end && rows[0].GetString(1) == "done", nil
+	return *checkpoint.checkpoint == chunkJob.end && checkpoint.status == "done", nil
 }
 
 func executeSQLNoResult(ctx context.Context, se sessiontypes.Session, sql string) error {

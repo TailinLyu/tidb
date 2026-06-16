@@ -101,6 +101,18 @@ func TestMaxExecutionTime(t *testing.T) {
 	require.Equal(t, uint64(99999), vars.MaxExecutionTime)
 }
 
+func TestNonTransactionalDMLExecutionMode(t *testing.T) {
+	sv := GetSysVar(TiDBNonTransactionalDMLExecutionMode)
+	vars := NewSessionVars(nil)
+
+	val, err := sv.Validate(vars, "DXF", ScopeSession)
+	require.NoError(t, err)
+	require.Equal(t, "dxf", val)
+
+	require.NoError(t, sv.SetSessionFromHook(vars, val))
+	require.Equal(t, "dxf", vars.NonTransactionalDMLExecutionMode)
+}
+
 func TestTiFlashMaxBytes(t *testing.T) {
 	varNames := []string{TiDBMaxBytesBeforeTiFlashExternalJoin, TiDBMaxBytesBeforeTiFlashExternalGroupBy, TiDBMaxBytesBeforeTiFlashExternalSort}
 	for index, varName := range varNames {

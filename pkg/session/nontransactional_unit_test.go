@@ -16,6 +16,7 @@ package session
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/kv"
@@ -112,6 +113,32 @@ func TestBuildNonTransactionalDMLRangeChunkSQLAddsHandleBounds(t *testing.T) {
 	require.Contains(t, sql, "`a` <= 5")
 	require.NotContains(t, sql, "`a` >")
 	require.Contains(t, sql, "`b` < 10")
+}
+
+func TestSplitNonTransactionalDMLSignedHandleRange(t *testing.T) {
+	ranges := splitNonTransactionalDMLSignedHandleRange(1, 6, 2)
+	require.Len(t, ranges, 2)
+	require.Nil(t, ranges[0].RangeStart)
+	require.Equal(t, int64(3), *ranges[0].RangeEnd)
+	require.Equal(t, int64(3), *ranges[1].RangeStart)
+	require.Equal(t, int64(6), *ranges[1].RangeEnd)
+
+	ranges = splitNonTransactionalDMLSignedHandleRange(-2, 2, 10)
+	require.Len(t, ranges, 5)
+	require.Nil(t, ranges[0].RangeStart)
+	for i, r := range ranges {
+		require.Equal(t, int64(-2+i), *r.RangeEnd)
+		if i > 0 {
+			require.Equal(t, *ranges[i-1].RangeEnd, *r.RangeStart)
+		}
+	}
+
+	ranges = splitNonTransactionalDMLSignedHandleRange(math.MinInt64, math.MinInt64+1, 2)
+	require.Len(t, ranges, 2)
+	require.Nil(t, ranges[0].RangeStart)
+	require.Equal(t, int64(math.MinInt64), *ranges[0].RangeEnd)
+	require.Equal(t, int64(math.MinInt64), *ranges[1].RangeStart)
+	require.Equal(t, int64(math.MinInt64+1), *ranges[1].RangeEnd)
 }
 
 func parseNonTransactionalDML(t *testing.T, sql string) *ast.NonTransactionalDMLStmt {
