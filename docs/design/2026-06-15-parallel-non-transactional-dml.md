@@ -132,6 +132,7 @@ P1 rejects in range mode:
 * `INSERT INTO SELECT`;
 * predicates or assignments that reference user variables, system variables, or session-local information functions such as `connection_id()` and `last_insert_id()`;
 * non-handle shard columns;
+* partitioned tables;
 * composite clustered primary keys;
 * unsigned integer handles;
 * string, binary, decimal, date/time, or other common-handle key types;
@@ -387,7 +388,7 @@ The range executor keeps the existing constraints:
 
 P1 adds stricter range-mode constraints listed in [P1 Scope](#p1-scope). Unsupported range-mode statements fail with an error that points to the legacy serial executor as the compatibility path.
 
-For partitioned tables, P1 can either reject range mode or plan each physical partition independently. The first implementation should choose one behavior explicitly in tests.
+P1 rejects partitioned tables. A later DXF phase can plan each physical partition independently after specifying physical range identity, ownership, and checkpoint semantics per partition.
 
 Schema changes during execution need explicit handling. P1 captures the schema version used for planning. If a relevant schema change affects the handle column, target table identity, assignment validity, or predicate evaluation, the task fails with a permanent schema-change error. Automatic re-planning is left to a later design.
 
@@ -400,12 +401,13 @@ Schema changes during execution need explicit handling. P1 captures the schema v
 3. Range mode rejects multi-table `UPDATE`.
 4. Range mode rejects `INSERT INTO SELECT`.
 5. Range mode rejects composite clustered primary keys.
-6. Range mode accepts `_tidb_rowid`.
-7. Range mode accepts a single-column signed integer clustered primary key.
-8. `LIMIT` bounds each chunk's qualifying-handle scan, while concurrent changes can make affected rows differ from the scanned handle count.
-9. The checkpoint uses an exclusive continuation key.
-10. `UPDATE t SET c = c + 1` documents and exercises retry semantics.
-11. A checkpoint and mutation commit atomically in the chunk transaction.
+6. Range mode rejects partitioned tables.
+7. Range mode accepts `_tidb_rowid`.
+8. Range mode accepts a single-column signed integer clustered primary key.
+9. `LIMIT` bounds each chunk's qualifying-handle scan, while concurrent changes can make affected rows differ from the scanned handle count.
+10. The checkpoint uses an exclusive continuation key.
+11. `UPDATE t SET c = c + 1` documents and exercises retry semantics.
+12. A checkpoint and mutation commit atomically in the chunk transaction.
 
 ### Scenario Tests
 
@@ -519,7 +521,6 @@ Pipelined DML addresses large transaction memory limits while preserving transac
 ## Unresolved Questions
 
 1. Should parser support for `CONCURRENCY` be part of P1, or should P1 use only session variables?
-2. Should partitioned tables be rejected in P1 or planned per physical partition?
-3. What is the exact on-disk representation for executable statement metadata?
-4. Should checkpoint records be stored in a new system table or in an extension to DXF subtask checkpoint storage?
-5. What retry limit and backoff defaults are appropriate for range-mode DML?
+2. What is the exact on-disk representation for executable statement metadata?
+3. Should checkpoint records be stored in a new system table or in an extension to DXF subtask checkpoint storage?
+4. What retry limit and backoff defaults are appropriate for range-mode DML?

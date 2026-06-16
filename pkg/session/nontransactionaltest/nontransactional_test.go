@@ -378,6 +378,8 @@ func TestNonTransactionalDMLRangeModeRejectsUnsupportedShapes(t *testing.T) {
 	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='range'")
 	tk.MustExec("create table t(a int primary key clustered, b int, key idx_b(b))")
 	tk.MustExec("create table t1(a int primary key clustered, b int)")
+	tk.MustExec("create table t_part_pk(a int primary key clustered, b int) partition by hash(a) partitions 2")
+	tk.MustExec("create table t_part_rowid(a int, b int) partition by hash(a) partitions 2")
 	tk.MustExec("insert into t values (1, 1), (2, 2)")
 
 	err := tk.ExecToErr("batch on a limit 1 insert into t1 select * from t")
@@ -402,6 +404,12 @@ func TestNonTransactionalDMLRangeModeRejectsUnsupportedShapes(t *testing.T) {
 
 	err = tk.ExecToErr("batch on a limit 1 update t set b = connection_id() where a <= 2")
 	require.ErrorContains(t, err, "session-local functions")
+
+	err = tk.ExecToErr("batch on a limit 1 update t_part_pk set b = b + 1")
+	require.ErrorContains(t, err, "range mode doesn't support partitioned tables")
+
+	err = tk.ExecToErr("batch on _tidb_rowid limit 1 update t_part_rowid set b = b + 1")
+	require.ErrorContains(t, err, "range mode doesn't support partitioned tables")
 }
 
 func TestNonTransactionalDMLRangeModeDeleteAndUpdate(t *testing.T) {

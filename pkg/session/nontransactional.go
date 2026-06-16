@@ -551,15 +551,21 @@ func checkRangeModeConstraint(stmt *ast.NonTransactionalDMLStmt, se sessiontypes
 	if containsRangeModeSessionLocalState(stmt.DMLStmt) {
 		return errors.New("Non-transactional DML range mode doesn't support user variables, system variable references, or session-local functions")
 	}
+
+	var tableInfo *model.TableInfo
+	if se != nil && tableName != nil {
+		tbl, err := domain.GetDomain(se).InfoSchema().TableByName(context.Background(), tableName.Schema, tableName.Name)
+		if err != nil {
+			return err
+		}
+		tableInfo = tbl.Meta()
+		if tableInfo.GetPartitionInfo() != nil {
+			return errors.New("Non-transactional DML range mode doesn't support partitioned tables")
+		}
+	}
 	if shardColumnInfo == nil {
 		return nil
 	}
-
-	tbl, err := domain.GetDomain(se).InfoSchema().TableByName(context.Background(), tableName.Schema, tableName.Name)
-	if err != nil {
-		return err
-	}
-	tableInfo := tbl.Meta()
 	if !tableInfo.PKIsHandle ||
 		!mysql.HasPriKeyFlag(shardColumnInfo.GetFlag()) ||
 		!isSignedIntegerType(shardColumnInfo.GetType()) ||
