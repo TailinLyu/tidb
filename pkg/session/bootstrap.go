@@ -626,6 +626,21 @@ const (
 		UNIQUE KEY task_key(task_key)
 	);`
 
+	// CreateNonTransactionalDMLCheckpoint stores committed chunk progress for range-mode non-transactional DML.
+	CreateNonTransactionalDMLCheckpoint = `CREATE TABLE IF NOT EXISTS mysql.tidb_nontransactional_dml_checkpoint (
+		job_id VARCHAR(128) NOT NULL,
+		range_id BIGINT NOT NULL,
+		table_id BIGINT NOT NULL,
+		current_db VARCHAR(64) NOT NULL,
+		table_name VARCHAR(64) NOT NULL,
+		checkpoint BIGINT DEFAULT NULL,
+		status VARCHAR(16) NOT NULL,
+		scanned BIGINT NOT NULL DEFAULT 0,
+		affected BIGINT NOT NULL DEFAULT 0,
+		error TEXT DEFAULT NULL,
+		update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+		PRIMARY KEY (job_id, range_id));`
+
 	// CreateDistFrameworkMeta create a system table that distributed task framework use to store meta information
 	CreateDistFrameworkMeta = `CREATE TABLE IF NOT EXISTS mysql.dist_framework_meta (
         host VARCHAR(261) NOT NULL PRIMARY KEY,
@@ -1275,12 +1290,12 @@ const (
 	// [version228, version238] is the version range reserved for patches of 8.5.x
 	// ...
 	// next version should start with 239
-
+	version239 = 239
 )
 
 // currentBootstrapVersion is defined as a variable, so we can modify its value for testing.
 // please make sure this is the largest version
-var currentBootstrapVersion int64 = version227
+var currentBootstrapVersion int64 = version239
 
 // DDL owner key's expired time is ManagerSessionTTL seconds, we should wait the time and give more time to have a chance to finish it.
 var internalSQLTimeout = owner.ManagerSessionTTL + 15
@@ -1463,6 +1478,7 @@ var (
 		upgradeToVer225,
 		upgradeToVer226,
 		upgradeToVer227,
+		upgradeToVer239,
 	}
 )
 
@@ -3406,6 +3422,14 @@ func upgradeToVer227(s sessiontypes.Session, ver int64) {
 	doReentrantDDL(s, "ALTER TABLE mysql.tidb_pitr_id_map ADD PRIMARY KEY(restore_id, restored_ts, upstream_cluster_id, segment_id)")
 }
 
+func upgradeToVer239(s sessiontypes.Session, ver int64) {
+	if ver >= version239 {
+		return
+	}
+
+	doReentrantDDL(s, CreateNonTransactionalDMLCheckpoint)
+}
+
 func getPrimaryKeyColsOrEmpty(s sessiontypes.Session, dbName, tableName string) []string {
 	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnBootstrap)
 	rows, err := sqlexec.ExecSQL(ctx, s, `
@@ -3551,6 +3575,8 @@ func doDDLWorks(s sessiontypes.Session) {
 	mustExecute(s, CreateGlobalTask)
 	// Create tidb_global_task_history table
 	mustExecute(s, CreateGlobalTaskHistory)
+	// Create tidb_nontransactional_dml_checkpoint table
+	mustExecute(s, CreateNonTransactionalDMLCheckpoint)
 	// Create tidb_import_jobs
 	mustExecute(s, CreateImportJobs)
 	// create runaway_watch

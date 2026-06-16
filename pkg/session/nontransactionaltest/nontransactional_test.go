@@ -370,6 +370,81 @@ func TestNonTransactionalWithCheckConstraint(t *testing.T) {
 	require.EqualError(t, err, "Non-transactional DML, table name not found in join")
 }
 
+func TestNonTransactionalDMLRangeModeRejectsUnsupportedShapes(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='range'")
+	tk.MustExec("create table t(a int primary key clustered, b int, key idx_b(b))")
+	tk.MustExec("create table t1(a int primary key clustered, b int)")
+	tk.MustExec("insert into t values (1, 1), (2, 2)")
+
+	err := tk.ExecToErr("batch on a limit 1 insert into t1 select * from t")
+	require.ErrorContains(t, err, "range mode supports DELETE and UPDATE only")
+
+	err = tk.ExecToErr("batch on t.b limit 1 delete t from t join t1 on t.a = t1.a")
+	require.ErrorContains(t, err, "range mode supports single-table statements only")
+
+	err = tk.ExecToErr("batch on b limit 1 delete from t")
+	require.ErrorContains(t, err, "range mode requires _tidb_rowid or a single signed integer clustered primary key")
+
+	err = tk.ExecToErr("batch on a limit 1 update t set a = a + 10")
+	require.ErrorContains(t, err, "shard column cannot be updated")
+}
+
+func TestNonTransactionalDMLRangeModeDeleteAndUpdate(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='range'")
+	tk.MustExec("set @@tidb_nontransactional_dml_concurrency=2")
+	tk.MustExec("create table t(a int primary key clustered, b int)")
+	for i := 1; i <= 9; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
+	}
+
+	tk.MustQuery("batch on a limit 2 update t set b = b + 10 where a <= 6").
+		Check(testkit.Rows("3 all succeeded"))
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
+		"1 11", "2 12", "3 13", "4 14", "5 15", "6 16", "7 7", "8 8", "9 9",
+	))
+
+	tk.MustQuery("batch on a limit 3 delete from t where b >= 13").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
+		"1 11", "2 12", "7 7", "8 8", "9 9",
+	))
+
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't' and status = 'done'").
+		Check(testkit.Rows("5"))
+}
+
+func TestNonTransactionalDMLRangeModeRetriesChunkBeforeCommit(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+
+	require.NoError(t, failpoint.Enable(
+		"github.com/pingcap/tidb/pkg/session/nonTransactionalDMLRangeChunkRetryableError",
+		`1*return(true)->return(false)`,
+	))
+	defer func() {
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/session/nonTransactionalDMLRangeChunkRetryableError"))
+	}()
+
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='range'")
+	tk.MustExec("create table t(a int primary key clustered, b int)")
+	tk.MustExec("insert into t values (1, 1), (2, 2), (3, 3)")
+
+	tk.MustQuery("batch on a limit 3 update t set b = b + 1").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows("1 2", "2 3", "3 4"))
+	tk.MustQuery("select status, count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't' group by status").
+		Check(testkit.Rows("done 1"))
+}
+
 func TestNonTransactionalDMLWorkWithForeignKey(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)

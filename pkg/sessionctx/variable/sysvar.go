@@ -2725,6 +2725,19 @@ var defaultSysVars = []*SysVar{
 			return nil
 		},
 	},
+	{Scope: ScopeGlobal | ScopeSession, Name: TiDBNonTransactionalDMLExecutionMode, Value: DefTiDBNonTransactionalDMLExecutionMode, Type: TypeEnum,
+		PossibleValues: []string{"serial", "range"},
+		SetSession: func(s *SessionVars, val string) error {
+			s.NonTransactionalDMLExecutionMode = strings.ToLower(val)
+			return nil
+		},
+	},
+	{Scope: ScopeGlobal | ScopeSession, Name: TiDBNonTransactionalDMLConcurrency, Value: strconv.Itoa(DefTiDBNonTransactionalDMLConcurrency), Type: TypeUnsigned, MinValue: 1, MaxValue: MaxConfigurableConcurrency,
+		SetSession: func(s *SessionVars, val string) error {
+			s.NonTransactionalDMLConcurrency = int(TidbOptInt64(val, DefTiDBNonTransactionalDMLConcurrency))
+			return nil
+		},
+	},
 	{Scope: ScopeGlobal | ScopeSession, Name: TiFlashFineGrainedShuffleStreamCount, Value: strconv.Itoa(DefTiFlashFineGrainedShuffleStreamCount), Type: TypeInt, MinValue: -1, MaxValue: 1024,
 		SetSession: func(s *SessionVars, val string) error {
 			s.TiFlashFineGrainedShuffleStreamCount = TidbOptInt64(val, DefTiFlashFineGrainedShuffleStreamCount)

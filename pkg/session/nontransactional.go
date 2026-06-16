@@ -18,12 +18,16 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/errno"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
@@ -99,6 +103,11 @@ func HandleNonTransactionalDML(ctx context.Context, stmt *ast.NonTransactionalDM
 	if err := checkConstraint(stmt, se); err != nil {
 		return nil, err
 	}
+	if sessVars.NonTransactionalDMLExecutionMode == "range" {
+		if err := checkRangeModeStatementShape(stmt); err != nil {
+			return nil, err
+		}
+	}
 
 	tableName, selectSQL, shardColumnInfo, tableSources, err := buildSelectSQL(stmt, nodeW.GetResolveContext(), se)
 	if err != nil {
@@ -107,6 +116,10 @@ func HandleNonTransactionalDML(ctx context.Context, stmt *ast.NonTransactionalDM
 
 	if err := checkConstraintWithShardColumn(se, stmt, tableName, shardColumnInfo, tableSources); err != nil {
 		return nil, err
+	}
+
+	if sessVars.NonTransactionalDMLExecutionMode == "range" {
+		return handleNonTransactionalDMLByRange(ctx, stmt, se, nodeW.GetResolveContext(), tableName, shardColumnInfo, tableSources)
 	}
 
 	if stmt.DryRun == ast.DryRunQuery {
@@ -133,6 +146,27 @@ func HandleNonTransactionalDML(ctx context.Context, stmt *ast.NonTransactionalDM
 		return buildDryRunResults(stmt.DryRun, splitStmts, se.GetSessionVars().BatchSize.MaxChunkSize)
 	}
 	return buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+}
+
+func checkRangeModeStatementShape(stmt *ast.NonTransactionalDMLStmt) error {
+	switch stmt.DMLStmt.(type) {
+	case *ast.DeleteStmt, *ast.UpdateStmt:
+	default:
+		return errors.New("Non-transactional DML range mode supports DELETE and UPDATE only")
+	}
+
+	join, ok := stmt.DMLStmt.TableRefsJoin()
+	if !ok {
+		return errors.New("Non-transactional DML, table source not found")
+	}
+	tableSources, err := collectTableSourcesInJoin(join, nil)
+	if err != nil {
+		return err
+	}
+	if len(tableSources) != 1 {
+		return errors.New("Non-transactional DML range mode supports single-table statements only")
+	}
+	return nil
 }
 
 // we require:
@@ -442,6 +476,562 @@ func doOneJob(ctx context.Context, job *job, totalJobCount int, options statemen
 		_ = rs.Close()
 	}
 	return ""
+}
+
+type nonTransactionalDMLRangeContext struct {
+	stmt              *ast.NonTransactionalDMLStmt
+	tableInfo         *model.TableInfo
+	dbName            string
+	currentDB         string
+	tableName         string
+	tableAlias        string
+	fromSQL           string
+	handleName        string
+	handleExprSQL     string
+	handleColumn      *ast.ColumnName
+	handleColumnType  types.FieldType
+	originalCondition ast.ExprNode
+	originalWhereSQL  string
+	jobID             string
+}
+
+type nonTransactionalDMLRangeChunk struct {
+	jobID   string
+	rangeID int64
+	start   *int64
+	end     int64
+	size    int
+	sql     string
+}
+
+const (
+	nonTransactionalDMLRangeMaxRetries     = 3
+	nonTransactionalDMLRangeRetryBackoff   = 50 * time.Millisecond
+	nonTransactionalDMLRangeInjectedErrMsg = "injected non-transactional DML range chunk retryable error"
+)
+
+func handleNonTransactionalDMLByRange(ctx context.Context, stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
+	resolveCtx *resolve.Context, tableName *ast.TableName, shardColumnInfo *model.ColumnInfo,
+	tableSources []*ast.TableSource) (sqlexec.RecordSet, error) {
+	if err := checkRangeModeConstraint(stmt, se, tableName, shardColumnInfo, tableSources); err != nil {
+		return nil, err
+	}
+	if stmt.DryRun != ast.NoDryRun {
+		return nil, errors.New("Non-transactional DML range mode doesn't support dry run")
+	}
+	if stmt.Limit == 0 || stmt.Limit > uint64(math.MaxInt64) {
+		return nil, errors.New("Non-transactional DML, batch size should be positive")
+	}
+
+	tnW := resolveCtx.GetTableName(tableName)
+	if tnW == nil {
+		return nil, errors.New("Non-transactional DML range mode, table not found")
+	}
+	rangeCtx, err := buildNonTransactionalDMLRangeContext(stmt, se, tnW, tableName, shardColumnInfo, tableSources)
+	if err != nil {
+		return nil, err
+	}
+	jobs, err := runNonTransactionalDMLRange(ctx, rangeCtx, se, int(stmt.Limit))
+	if err != nil {
+		return nil, err
+	}
+	return buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+}
+
+func checkRangeModeConstraint(stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
+	tableName *ast.TableName, shardColumnInfo *model.ColumnInfo, tableSources []*ast.TableSource) error {
+	switch stmt.DMLStmt.(type) {
+	case *ast.DeleteStmt, *ast.UpdateStmt:
+	default:
+		return errors.New("Non-transactional DML range mode supports DELETE and UPDATE only")
+	}
+	if len(tableSources) != 1 {
+		return errors.New("Non-transactional DML range mode supports single-table statements only")
+	}
+	if shardColumnInfo == nil {
+		return nil
+	}
+
+	tbl, err := domain.GetDomain(se).InfoSchema().TableByName(context.Background(), tableName.Schema, tableName.Name)
+	if err != nil {
+		return err
+	}
+	tableInfo := tbl.Meta()
+	if !tableInfo.PKIsHandle ||
+		!mysql.HasPriKeyFlag(shardColumnInfo.GetFlag()) ||
+		!isSignedIntegerType(shardColumnInfo.GetType()) ||
+		mysql.HasUnsignedFlag(shardColumnInfo.GetFlag()) {
+		return errors.New("Non-transactional DML range mode requires _tidb_rowid or a single signed integer clustered primary key")
+	}
+	return nil
+}
+
+func isSignedIntegerType(tp byte) bool {
+	switch tp {
+	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong:
+		return true
+	default:
+		return false
+	}
+}
+
+func buildNonTransactionalDMLRangeContext(stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
+	tnW *resolve.TableNameW, tableName *ast.TableName, shardColumnInfo *model.ColumnInfo,
+	tableSources []*ast.TableSource) (*nonTransactionalDMLRangeContext, error) {
+	originalWhereSQL, err := restoreWhereExpression(stmt.DMLStmt.WhereExpr())
+	if err != nil {
+		return nil, err
+	}
+
+	dbName := tnW.DBInfo.Name.O
+	if dbName == "" {
+		dbName = se.GetSessionVars().CurrentDB
+	}
+	tableAlias := ""
+	if len(tableSources) > 0 {
+		tableAlias = tableSources[0].AsName.O
+	}
+
+	handleName := model.ExtraHandleName.O
+	handleColumnType := *types.NewFieldType(mysql.TypeLonglong)
+	if shardColumnInfo != nil {
+		handleName = shardColumnInfo.Name.O
+		handleColumnType = shardColumnInfo.FieldType
+	}
+	qualifier := tableName.Name.O
+	if tableAlias != "" {
+		qualifier = tableAlias
+	}
+	fromSQL := fmt.Sprintf("%s.%s", quoteIdentifier(dbName), quoteIdentifier(tableName.Name.O))
+	if tableAlias != "" {
+		fromSQL = fmt.Sprintf("%s AS %s", fromSQL, quoteIdentifier(tableAlias))
+	}
+	handleExprSQL := fmt.Sprintf("%s.%s", quoteIdentifier(qualifier), quoteIdentifier(handleName))
+	handleColumn := &ast.ColumnName{
+		Schema: stmt.ShardColumn.Schema,
+		Table:  stmt.ShardColumn.Table,
+		Name:   stmt.ShardColumn.Name,
+	}
+	currentDB := se.GetSessionVars().CurrentDB
+	if currentDB == "" {
+		currentDB = dbName
+	}
+
+	return &nonTransactionalDMLRangeContext{
+		stmt:              stmt,
+		tableInfo:         tnW.TableInfo,
+		dbName:            dbName,
+		currentDB:         currentDB,
+		tableName:         tableName.Name.O,
+		tableAlias:        tableAlias,
+		fromSQL:           fromSQL,
+		handleName:        handleName,
+		handleExprSQL:     handleExprSQL,
+		handleColumn:      handleColumn,
+		handleColumnType:  handleColumnType,
+		originalCondition: stmt.DMLStmt.WhereExpr(),
+		originalWhereSQL:  originalWhereSQL,
+		jobID:             fmt.Sprintf("%d-%d", tnW.TableInfo.ID, time.Now().UnixNano()),
+	}, nil
+}
+
+func restoreWhereExpression(expr ast.ExprNode) (string, error) {
+	if expr == nil {
+		return "TRUE", nil
+	}
+	var sb strings.Builder
+	err := expr.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags|
+		format.RestoreNameBackQuotes|
+		format.RestoreSpacesAroundBinaryOperation|
+		format.RestoreBracketAroundBinaryOperation|
+		format.RestoreStringWithoutCharset, &sb))
+	if err != nil {
+		return "", errors.Annotate(err, "Failed to restore where clause in non-transactional DML range mode")
+	}
+	return sb.String(), nil
+}
+
+func runNonTransactionalDMLRange(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
+	se sessiontypes.Session, batchSize int) ([]job, error) {
+	concurrency := se.GetSessionVars().NonTransactionalDMLConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	workerCtx, cancel := context.WithCancel(kv.WithInternalSourceType(ctx, kv.InternalTxnOthers))
+	defer cancel()
+	chunkCh := make(chan nonTransactionalDMLRangeChunk, concurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	jobs := make([]job, 0)
+	var firstErr error
+
+	recordJob := func(j job) {
+		mu.Lock()
+		defer mu.Unlock()
+		jobs = append(jobs, j)
+		if j.err != nil && firstErr == nil {
+			firstErr = j.err
+			if !se.GetSessionVars().NonTransactionalIgnoreError {
+				cancel()
+			}
+		}
+	}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker, err := CreateSession(se.GetStore())
+			if err != nil {
+				recordJob(job{jobID: 0, err: err})
+				return
+			}
+			defer worker.Close()
+			if err := prepareNonTransactionalDMLRangeWorker(workerCtx, se, worker, rangeCtx.currentDB); err != nil {
+				recordJob(job{jobID: 0, err: err})
+				return
+			}
+			for chunkJob := range chunkCh {
+				select {
+				case <-workerCtx.Done():
+					return
+				default:
+				}
+				recordJob(executeNonTransactionalDMLRangeChunkWithRetry(workerCtx, rangeCtx, worker, chunkJob))
+			}
+		}()
+	}
+
+	plannerErr := planNonTransactionalDMLRangeChunks(workerCtx, rangeCtx, se, batchSize, chunkCh)
+	close(chunkCh)
+	wg.Wait()
+
+	sort.Slice(jobs, func(i, j int) bool {
+		return jobs[i].jobID < jobs[j].jobID
+	})
+	if firstErr != nil && !se.GetSessionVars().NonTransactionalIgnoreError {
+		if len(jobs) > 0 {
+			failed := jobs[0]
+			for _, j := range jobs {
+				if j.err != nil {
+					failed = j
+					break
+				}
+			}
+			return nil, ErrNonTransactionalJobFailure.GenWithStackByArgs(failed.jobID, len(jobs), failed.start.String(), failed.end.String(), failed.String(se.GetSessionVars().EnableRedactLog), firstErr.Error())
+		}
+		return nil, firstErr
+	}
+	if plannerErr != nil && errors.Cause(plannerErr) != context.Canceled {
+		return nil, plannerErr
+	}
+	if firstErr != nil && se.GetSessionVars().NonTransactionalIgnoreError {
+		return jobs, nil
+	}
+	if plannerErr != nil && len(jobs) == 0 {
+		return nil, plannerErr
+	}
+	return jobs, nil
+}
+
+func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessiontypes.Session, worker sessiontypes.Session, currentDB string) error {
+	if parent.GetSessionVars().User != nil {
+		user := *parent.GetSessionVars().User
+		worker.AuthWithoutVerification(&user)
+	}
+	copyVars := []string{
+		variable.SQLModeVar,
+		variable.TimeZone,
+		variable.CharacterSetConnection,
+		variable.CollationConnection,
+		variable.TiDBRedactLog,
+	}
+	for _, name := range copyVars {
+		if val, ok := parent.GetSessionVars().GetSystemVar(name); ok {
+			if err := worker.GetSessionVars().SetSystemVar(name, val); err != nil {
+				return err
+			}
+		}
+	}
+	if currentDB == "" {
+		return nil
+	}
+	return executeInternalNoResult(ctx, worker, "USE %n", currentDB)
+}
+
+func planNonTransactionalDMLRangeChunks(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
+	se sessiontypes.Session, batchSize int, chunkCh chan<- nonTransactionalDMLRangeChunk) error {
+	var start *int64
+	for rangeID := int64(1); ; rangeID++ {
+		handles, err := selectNextNonTransactionalDMLRangeHandles(ctx, rangeCtx, se, start, batchSize)
+		if err != nil {
+			return err
+		}
+		if len(handles) == 0 {
+			return nil
+		}
+		end := handles[len(handles)-1]
+		sql, err := buildNonTransactionalDMLRangeChunkSQL(rangeCtx, start, end)
+		if err != nil {
+			return err
+		}
+		chunkJob := nonTransactionalDMLRangeChunk{
+			jobID:   rangeCtx.jobID,
+			rangeID: rangeID,
+			start:   cloneInt64Ptr(start),
+			end:     end,
+			size:    len(handles),
+			sql:     sql,
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case chunkCh <- chunkJob:
+		}
+		nextStart := end
+		start = &nextStart
+		if len(handles) < batchSize {
+			return nil
+		}
+	}
+}
+
+func selectNextNonTransactionalDMLRangeHandles(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
+	se sessiontypes.Session, start *int64, batchSize int) ([]int64, error) {
+	whereSQL := fmt.Sprintf("(%s)", rangeCtx.originalWhereSQL)
+	args := make([]any, 0, 1)
+	if start != nil {
+		whereSQL = fmt.Sprintf("%s AND %s > %%?", whereSQL, rangeCtx.handleExprSQL)
+		args = append(args, *start)
+	}
+	sql := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d",
+		rangeCtx.handleExprSQL, rangeCtx.fromSQL, whereSQL, rangeCtx.handleExprSQL, batchSize)
+	rows, err := sqlexec.ExecSQL(ctx, se, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	handles := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		handles = append(handles, row.GetInt64(0))
+	}
+	return handles, nil
+}
+
+func buildNonTransactionalDMLRangeChunkSQL(rangeCtx *nonTransactionalDMLRangeContext, start *int64, end int64) (string, error) {
+	whereCondition := buildNonTransactionalDMLRangeCondition(rangeCtx, start, end)
+	if rangeCtx.originalCondition != nil {
+		whereCondition = &ast.BinaryOperationExpr{
+			Op: opcode.LogicAnd,
+			L:  whereCondition,
+			R:  rangeCtx.originalCondition,
+		}
+	}
+
+	rangeCtx.stmt.DMLStmt.SetWhereExpr(whereCondition)
+	defer rangeCtx.stmt.DMLStmt.SetWhereExpr(rangeCtx.originalCondition)
+
+	var sb strings.Builder
+	err := rangeCtx.stmt.DMLStmt.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags|
+		format.RestoreNameBackQuotes|
+		format.RestoreSpacesAroundBinaryOperation|
+		format.RestoreBracketAroundBinaryOperation|
+		format.RestoreStringWithoutCharset, &sb))
+	if err != nil {
+		return "", errors.Annotate(err, "Failed to restore the DML statement in non-transactional DML range mode")
+	}
+	return sb.String(), nil
+}
+
+func buildNonTransactionalDMLRangeCondition(rangeCtx *nonTransactionalDMLRangeContext, start *int64, end int64) ast.ExprNode {
+	handleExpr := func() *ast.ColumnNameExpr {
+		return &ast.ColumnNameExpr{Name: &ast.ColumnName{
+			Schema: rangeCtx.handleColumn.Schema,
+			Table:  rangeCtx.handleColumn.Table,
+			Name:   rangeCtx.handleColumn.Name,
+		}}
+	}
+	valueExpr := func(value int64) *driver.ValueExpr {
+		expr := &driver.ValueExpr{}
+		expr.Type = rangeCtx.handleColumnType
+		expr.Datum = types.NewIntDatum(value)
+		return expr
+	}
+	leCondition := &ast.BinaryOperationExpr{
+		Op: opcode.LE,
+		L:  handleExpr(),
+		R:  valueExpr(end),
+	}
+	if start == nil {
+		return leCondition
+	}
+	gtCondition := &ast.BinaryOperationExpr{
+		Op: opcode.GT,
+		L:  handleExpr(),
+		R:  valueExpr(*start),
+	}
+	return &ast.BinaryOperationExpr{
+		Op: opcode.LogicAnd,
+		L:  gtCondition,
+		R:  leCondition,
+	}
+}
+
+func executeNonTransactionalDMLRangeChunkWithRetry(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
+	se sessiontypes.Session, chunkJob nonTransactionalDMLRangeChunk) job {
+	var last job
+	for attempt := 0; attempt <= nonTransactionalDMLRangeMaxRetries; attempt++ {
+		result, retryable := executeNonTransactionalDMLRangeChunk(ctx, rangeCtx, se, chunkJob)
+		if result.err == nil {
+			return result
+		}
+		last = result
+		if !retryable || attempt == nonTransactionalDMLRangeMaxRetries {
+			return result
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * nonTransactionalDMLRangeRetryBackoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			last.err = ctx.Err()
+			return last
+		case <-timer.C:
+		}
+	}
+	return last
+}
+
+func executeNonTransactionalDMLRangeChunk(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
+	se sessiontypes.Session, chunkJob nonTransactionalDMLRangeChunk) (job, bool) {
+	result := job{
+		jobID:   int(chunkJob.rangeID),
+		start:   datumFromInt64Ptr(chunkJob.start),
+		end:     types.NewIntDatum(chunkJob.end),
+		jobSize: chunkJob.size,
+		sql:     chunkJob.sql,
+	}
+	if err := executeInternalNoResult(ctx, se, "BEGIN"); err != nil {
+		result.err = err
+		return result, true
+	}
+	failpoint.Inject("nonTransactionalDMLRangeChunkRetryableError", func(val failpoint.Value) {
+		if val.(bool) {
+			err := errors.New(nonTransactionalDMLRangeInjectedErrMsg)
+			_ = executeInternalNoResult(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, "ROLLBACK")
+			result.err = err
+			_ = writeNonTransactionalDMLRangeCheckpoint(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), rangeCtx, se, chunkJob, "failed", 0, err)
+			failpoint.Return(result, true)
+		}
+	})
+	if err := executeSQLNoResult(ctx, se, chunkJob.sql); err != nil {
+		_ = executeInternalNoResult(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, "ROLLBACK")
+		result.err = err
+		_ = writeNonTransactionalDMLRangeCheckpoint(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), rangeCtx, se, chunkJob, "failed", 0, err)
+		return result, true
+	}
+	affectedRows := se.AffectedRows()
+	if err := writeNonTransactionalDMLRangeCheckpoint(ctx, rangeCtx, se, chunkJob, "done", affectedRows, nil); err != nil {
+		_ = executeInternalNoResult(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, "ROLLBACK")
+		result.err = err
+		return result, true
+	}
+	if err := executeInternalNoResult(ctx, se, "COMMIT"); err != nil {
+		committed, checkErr := nonTransactionalDMLRangeCheckpointDone(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, chunkJob)
+		if checkErr == nil && committed {
+			return result, false
+		}
+		if checkErr != nil {
+			err = errors.Annotatef(err, "failed to verify range checkpoint after commit error: %v", checkErr)
+		}
+		result.err = err
+		return result, false
+	}
+	return result, false
+}
+
+func writeNonTransactionalDMLRangeCheckpoint(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
+	se sessiontypes.Session, chunkJob nonTransactionalDMLRangeChunk, status string, affectedRows uint64, chunkErr error) error {
+	var errText any
+	if chunkErr != nil {
+		errText = chunkErr.Error()
+	}
+	return executeInternalNoResult(ctx, se, `REPLACE INTO mysql.tidb_nontransactional_dml_checkpoint
+		(job_id, range_id, table_id, current_db, table_name, checkpoint, status, scanned, affected, error)
+		VALUES (%?, %?, %?, %?, %?, %?, %?, %?, %?, %?)`,
+		chunkJob.jobID,
+		chunkJob.rangeID,
+		rangeCtx.tableInfo.ID,
+		rangeCtx.currentDB,
+		rangeCtx.tableName,
+		chunkJob.end,
+		status,
+		chunkJob.size,
+		affectedRows,
+		errText,
+	)
+}
+
+func nonTransactionalDMLRangeCheckpointDone(ctx context.Context, se sessiontypes.Session, chunkJob nonTransactionalDMLRangeChunk) (bool, error) {
+	rows, err := sqlexec.ExecSQL(ctx, se, `SELECT checkpoint, status FROM mysql.tidb_nontransactional_dml_checkpoint
+		WHERE job_id = %? AND range_id = %?`,
+		chunkJob.jobID,
+		chunkJob.rangeID,
+	)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) == 0 || rows[0].IsNull(0) {
+		return false, nil
+	}
+	return rows[0].GetInt64(0) == chunkJob.end && rows[0].GetString(1) == "done", nil
+}
+
+func executeSQLNoResult(ctx context.Context, se sessiontypes.Session, sql string) error {
+	rss, err := se.Execute(ctx, sql)
+	if err != nil {
+		return err
+	}
+	for _, rs := range rss {
+		if rs != nil {
+			_ = rs.Close()
+		}
+	}
+	return nil
+}
+
+func executeInternalNoResult(ctx context.Context, se sessiontypes.Session, sql string, args ...any) error {
+	rs, err := se.ExecuteInternal(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	if rs != nil {
+		_ = rs.Close()
+	}
+	return nil
+}
+
+func quoteIdentifier(name string) string {
+	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+func cloneInt64Ptr(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func datumFromInt64Ptr(value *int64) types.Datum {
+	if value == nil {
+		return types.NewDatum(nil)
+	}
+	return types.NewIntDatum(*value)
 }
 
 func buildShardJobs(ctx context.Context, stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
