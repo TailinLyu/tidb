@@ -548,6 +548,9 @@ func checkRangeModeConstraint(stmt *ast.NonTransactionalDMLStmt, se sessiontypes
 	if len(tableSources) != 1 {
 		return errors.New("Non-transactional DML range mode supports single-table statements only")
 	}
+	if containsRangeModeSessionLocalState(stmt.DMLStmt) {
+		return errors.New("Non-transactional DML range mode doesn't support user variables, system variable references, or session-local functions")
+	}
 	if shardColumnInfo == nil {
 		return nil
 	}
@@ -564,6 +567,57 @@ func checkRangeModeConstraint(stmt *ast.NonTransactionalDMLStmt, se sessiontypes
 		return errors.New("Non-transactional DML range mode requires _tidb_rowid or a single signed integer clustered primary key")
 	}
 	return nil
+}
+
+type rangeModeSessionLocalStateVisitor struct {
+	found bool
+}
+
+func (v *rangeModeSessionLocalStateVisitor) Enter(n ast.Node) (ast.Node, bool) {
+	switch node := n.(type) {
+	case *ast.VariableExpr:
+		v.found = true
+		return n, true
+	case *ast.FuncCallExpr:
+		if isRangeModeSessionLocalFunction(node.FnName.L) {
+			v.found = true
+			return n, true
+		}
+	}
+	return n, false
+}
+
+func (v *rangeModeSessionLocalStateVisitor) Leave(n ast.Node) (ast.Node, bool) {
+	return n, !v.found
+}
+
+func containsRangeModeSessionLocalState(node ast.Node) bool {
+	if node == nil {
+		return false
+	}
+	visitor := &rangeModeSessionLocalStateVisitor{}
+	node.Accept(visitor)
+	return visitor.found
+}
+
+func isRangeModeSessionLocalFunction(name string) bool {
+	switch name {
+	case ast.ConnectionID,
+		ast.CurrentResourceGroup,
+		ast.CurrentRole,
+		ast.CurrentUser,
+		ast.Database,
+		ast.FoundRows,
+		ast.LastInsertId,
+		ast.RowCount,
+		ast.Schema,
+		ast.SessionUser,
+		ast.SystemUser,
+		ast.User:
+		return true
+	default:
+		return false
+	}
 }
 
 func isSignedIntegerType(tp byte) bool {
@@ -736,20 +790,30 @@ func runNonTransactionalDMLRange(ctx context.Context, rangeCtx *nonTransactional
 }
 
 func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessiontypes.Session, worker sessiontypes.Session, currentDB string) error {
-	if parent.GetSessionVars().User != nil {
-		user := *parent.GetSessionVars().User
+	parentVars := parent.GetSessionVars()
+	workerVars := worker.GetSessionVars()
+	if parentVars.User != nil {
+		user := *parentVars.User
 		worker.AuthWithoutVerification(&user)
 	}
+	workerVars.ActiveRoles = append(workerVars.ActiveRoles[:0], parentVars.ActiveRoles...)
+	workerVars.SetResourceGroupName(parentVars.ResourceGroupName)
+	workerVars.StmtCtx.ResourceGroupName = parentVars.StmtCtx.ResourceGroupName
 	copyVars := []string{
 		variable.SQLModeVar,
 		variable.TimeZone,
 		variable.CharacterSetConnection,
 		variable.CollationConnection,
 		variable.TiDBRedactLog,
+		variable.ForeignKeyChecks,
+		variable.TiDBForeignKeyCheckInSharedLock,
+		variable.TiDBConstraintCheckInPlace,
+		variable.TiDBConstraintCheckInPlacePessimistic,
+		variable.TiDBEnableMutationChecker,
 	}
 	for _, name := range copyVars {
-		if val, ok := parent.GetSessionVars().GetSystemVar(name); ok {
-			if err := worker.GetSessionVars().SetSystemVar(name, val); err != nil {
+		if val, ok := parentVars.GetSystemVar(name); ok {
+			if err := workerVars.SetSystemVar(name, val); err != nil {
 				return err
 			}
 		}
@@ -932,7 +996,7 @@ func executeNonTransactionalDMLRangeChunk(ctx context.Context, rangeCtx *nonTran
 		_ = executeInternalNoResult(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, "ROLLBACK")
 		result.err = err
 		_ = writeNonTransactionalDMLRangeCheckpoint(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), rangeCtx, se, chunkJob, "failed", 0, err)
-		return result, true
+		return result, isNonTransactionalDMLRangeRetryableError(err)
 	}
 	affectedRows := se.AffectedRows()
 	if err := writeNonTransactionalDMLRangeCheckpoint(ctx, rangeCtx, se, chunkJob, "done", affectedRows, nil); err != nil {
@@ -952,6 +1016,16 @@ func executeNonTransactionalDMLRangeChunk(ctx context.Context, rangeCtx *nonTran
 		return result, false
 	}
 	return result, false
+}
+
+func isNonTransactionalDMLRangeRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), nonTransactionalDMLRangeInjectedErrMsg) {
+		return true
+	}
+	return kv.IsTxnRetryableError(err) || domain.ErrInfoSchemaChanged.Equal(err)
 }
 
 func writeNonTransactionalDMLRangeCheckpoint(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,

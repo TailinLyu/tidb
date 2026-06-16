@@ -54,17 +54,17 @@ ORDER BY IF(ISNULL(id), 0, 1), id;
 
 It then reads the full result, builds shard ranges of about `LIMIT` rows, and executes the resulting DML statements one by one. This avoids unsafe transaction splitting, but it is slow for large tables because execution cannot start until the qualifying-row pre-scan finishes and because split jobs run with parallelism 1.
 
-Users need a native TiDB mechanism that can make progress immediately, use controlled parallelism, bound each mutation transaction, and retry failed chunks without an external splitter.
+Users need a native TiDB mechanism that can make progress immediately, use controlled parallelism, keep each chunk's scan and mutation interval bounded, and retry safe transient failures without an external splitter.
 
 ## Goals
 
 1. Avoid the full qualifying-row pre-scan before starting DML execution.
 2. Execute non-transactional DML over handle ranges with configurable concurrency.
-3. Bound each mutation transaction by the user-specified `LIMIT`.
+3. Bound each chunk's initial handle scan by the user-specified `LIMIT`, and keep the mutation transaction constrained to that handle interval.
 4. Preserve explicit user opt-in through `BATCH` plus an explicit new execution mode.
 5. Preserve non-transactional semantics: no atomicity across chunks, no global snapshot isolation, and no rollback across chunks.
 6. Support single-table `DELETE` and `UPDATE` in P1.
-7. Persist per-chunk checkpoints durably enough for worker crash and DXF failover.
+7. Persist per-chunk checkpoints durably enough to classify ambiguous chunk commits in P1, and to become the failover/resume state for later DXF execution.
 8. Keep existing serial non-transactional DML behavior available for unsupported shapes.
 
 ## Non-goals
@@ -105,7 +105,7 @@ BATCH ON id LIMIT 10000 DELETE FROM t WHERE status = 'expired';
 
 The semantics are:
 
-* `LIMIT batch_size` is the target maximum number of target rows per mutation chunk.
+* `LIMIT batch_size` is the target maximum number of handles scanned per mutation chunk. Because the mutation rechecks the original predicate over the scanned handle interval, concurrent changes can make the affected row count differ from the scanned handle count.
 * `CONCURRENCY concurrency` is the maximum number of range workers or distributed subtasks.
 * If the user does not explicitly select the range executor, existing serial behavior is preserved.
 * If the range executor is explicitly selected and the statement shape is unsupported, TiDB returns an error instead of silently changing semantics.
@@ -130,6 +130,7 @@ P1 rejects in range mode:
 * multi-table `DELETE`;
 * multi-table `UPDATE`;
 * `INSERT INTO SELECT`;
+* predicates or assignments that reference user variables, system variables, or session-local information functions such as `connection_id()` and `last_insert_id()`;
 * non-handle shard columns;
 * composite clustered primary keys;
 * unsigned integer handles;
@@ -185,7 +186,7 @@ BATCH ON id LIMIT 10000 CONCURRENCY 8
 UPDATE t SET c = c + 1 WHERE status = 'active';
 ```
 
-If TiDB retries a chunk after an ambiguous commit, `c` might be incremented more than once unless the durable checkpoint proves that the chunk committed. This is documented behavior for the range executor.
+P1 does not blindly retry a chunk after an ambiguous commit. It first checks the durable checkpoint. If the checkpoint did not advance, TiDB reports the ambiguous outcome instead of replaying a possibly committed non-idempotent update. Non-idempotent assignments remain part of the user's explicit non-transactional opt-in for failures outside that checkpointed path.
 
 ### Executable Task Metadata
 
@@ -199,8 +200,8 @@ Task metadata is split into:
 * target table ID, physical table IDs, and schema version;
 * selected handle column ID and field type;
 * original `BATCH` options;
-* SQL mode, time zone, charset, collation, and relevant statement variables;
-* captured user/security context for privilege-checked internal execution.
+* SQL mode, time zone, charset, collation, foreign-key/check-related flags, and relevant statement variables;
+* captured user/security context, including active roles, for privilege-checked internal execution.
 
 If executable SQL with literals is stored in a system table, the privacy and security impact must be documented. Redaction settings must apply to display fields, not to the executable representation.
 
@@ -213,7 +214,9 @@ P1 plans ranges only on the table record handle keyspace. The planner chooses th
 3. If the table has an implicit row ID, use `_tidb_rowid`.
 4. Otherwise, reject the statement in range mode.
 
-P1 uses ordered keyset pagination over one logical handle range. It discovers the next chunk by selecting at most `batch_size` qualifying handles after the last durable checkpoint and then mutates the bounded handle interval for that chunk. This is enough to avoid full pre-scan materialization and to make mutation start immediately.
+P1 uses ordered keyset pagination over one logical handle range. It discovers the next chunk by selecting at most `batch_size` qualifying handles after the last in-memory continuation key and then mutates the bounded handle interval for that chunk. This is enough to avoid full pre-scan materialization and to make mutation start immediately.
+
+The chunk uses a handle interval rather than an exact handle set. Under concurrent writes, rows can begin or stop matching the original predicate between chunk discovery and mutation. The original predicate is always rechecked during mutation, but `LIMIT` is therefore a scan target, not a strict affected-row guarantee.
 
 Later DXF and adaptive-planning phases can ask the TiKV Region cache for Region boundaries over the table record keyspace and create multiple independently owned range tasks. Those range boundaries are scheduling hints. Correctness still comes from handle ordering, predicate recheck, and per-chunk checkpoints.
 
@@ -299,15 +302,15 @@ Each mutation chunk is a small transaction that contains:
 1. the user table mutation;
 2. an update to the checkpoint row with the exclusive last scanned handle and progress counters.
 
-This preserves the non-transactional contract across chunks while making each committed chunk and its checkpoint atomic with respect to failover. After a crash, a worker reads the checkpoint table and resumes from `(checkpoint, range_end)`.
+This preserves the non-transactional contract across chunks while making each committed chunk and its checkpoint atomic inside one invocation. In P1, the checkpoint is used to classify ambiguous commit results for the active job. Crash/failover resume is not complete until Phase 2 adds stable job identity, ownership, startup checkpoint discovery, and checkpoint lifecycle management.
 
-If the mutation transaction returns an ambiguous commit result, the retry path first reads the checkpoint row. If the checkpoint advanced, the chunk is treated as committed. If it did not advance, TiDB retries according to the retry policy.
+If the mutation transaction returns an ambiguous commit result, the retry path first reads the checkpoint row. If the checkpoint advanced, the chunk is treated as committed. If it did not advance, TiDB reports the ambiguous outcome instead of replaying a possibly committed non-idempotent update.
 
 ### DXF Integration
 
 The DXF task is responsible for ownership, scheduling, failover, and task history. The non-transactional DML executor is responsible for SQL-specific planning, checkpoint persistence, statement construction, and retry classification.
 
-The DXF subtask meta contains immutable range identity and executable task metadata references. It does not serve as the only progress checkpoint. Live progress is persisted in the checkpoint table after every committed chunk.
+The DXF subtask meta contains immutable range identity and executable task metadata references. It does not serve as the only progress checkpoint. Live progress is persisted in the checkpoint table after every committed chunk. DXF integration must also add stable job identity and startup checkpoint loading so a replacement owner can resume from `(checkpoint, range_end)`.
 
 The initial task type can be named `NonTransactionalDML` and have one execution step:
 
@@ -319,7 +322,7 @@ StepExecuteRanges
 
 The local executor uses the same range planner, chunk scan/mutate loop, and checkpoint table. It runs on the current TiDB node and can use multiple internal sessions capped by `tidb_nontransactional_dml_concurrency`.
 
-This local path is P1. DXF uses the same executor logic later with distributed ownership and failover.
+This local path is P1. DXF uses the same executor logic later with distributed ownership, stable job identity, checkpoint loading, and failover.
 
 ### Failure Handling and Retry
 
@@ -331,9 +334,9 @@ Errors are classified into:
 2. ambiguous commit result;
 3. permanent errors.
 
-Retryable errors before commit result is known are retried with bounded exponential backoff.
+Retryable errors before commit result is known are retried with bounded exponential backoff. P1 keeps this bucket narrow: known TiDB transaction-retryable errors and schema-change retry signals are retried, while deterministic statement errors such as constraint violations are recorded as permanent chunk failures.
 
-For ambiguous commit results, TiDB reads the durable checkpoint row before retrying. If the checkpoint advanced, TiDB skips to the next chunk. If the checkpoint did not advance, TiDB retries the chunk up to the configured retry limit. This still does not provide exactly-once semantics for every possible failure mode, but it prevents replay of already checkpointed chunks after worker crash or DXF failover.
+For ambiguous commit results, TiDB reads the durable checkpoint row before retrying. If the checkpoint advanced for the active job, TiDB skips to the next chunk. If the checkpoint did not advance, TiDB reports the ambiguous outcome instead of blindly replaying a possibly committed non-idempotent update. Full worker-crash and DXF-failover resume is a Phase 2 requirement.
 
 The existing `tidb_nontransactional_ignore_error` behavior is preserved at chunk level:
 
@@ -399,7 +402,7 @@ Schema changes during execution need explicit handling. P1 captures the schema v
 5. Range mode rejects composite clustered primary keys.
 6. Range mode accepts `_tidb_rowid`.
 7. Range mode accepts a single-column signed integer clustered primary key.
-8. `LIMIT` bounds each mutation chunk.
+8. `LIMIT` bounds each chunk's qualifying-handle scan, while concurrent changes can make affected rows differ from the scanned handle count.
 9. The checkpoint uses an exclusive continuation key.
 10. `UPDATE t SET c = c + 1` documents and exercises retry semantics.
 11. A checkpoint and mutation commit atomically in the chunk transaction.
@@ -407,7 +410,7 @@ Schema changes during execution need explicit handling. P1 captures the schema v
 ### Scenario Tests
 
 1. A large delete starts mutating before a full qualifying-row pre-scan would finish.
-2. A worker crash after committed chunks resumes from the durable checkpoint.
+2. An ambiguous commit result for the active job is classified by reading the durable checkpoint row.
 3. Permanent error with `tidb_nontransactional_ignore_error = 0` stops the task.
 4. Permanent error with `tidb_nontransactional_ignore_error = 1` records failure and continues where safe.
 5. Existing serial non-transactional DML still supports indexed shard columns when range mode is not selected.
@@ -443,7 +446,7 @@ Important metrics:
 
 ### Phase 1: Local Range Executor
 
-Implement P1 scope: local handle-range planning, chunk scan/mutate execution, explicit mode selection, and durable checkpoints.
+Implement P1 scope: local handle-range planning, chunk scan/mutate execution, explicit mode selection, and durable checkpoints for active-job ambiguous commit classification.
 
 ### Phase 2: DXF Distributed Executor
 
@@ -474,15 +477,15 @@ The proposed executor should:
 * reduce time to first mutation;
 * improve throughput on large DML jobs;
 * reduce TiDB memory usage by avoiding full pre-scan job materialization;
-* bound mutation transaction size by `LIMIT`;
-* provide resumable progress through durable checkpoints.
+* bound each chunk by a `LIMIT`-sized qualifying-handle scan and bounded handle interval;
+* provide durable checkpoint evidence for active-job chunk progress.
 
 ### Risks
 
 1. Parallel DML can increase write pressure on TiKV and downstream systems.
 2. Non-idempotent `UPDATE` can be applied more than once in failure modes not covered by durable chunk checkpoints.
 3. Storing executable SQL or serialized AST in system tables has privacy and security implications.
-4. Internal sessions must faithfully inherit user context that affects predicate and assignment evaluation.
+4. P1 rejects session-local variable references and session-local information functions because internal sessions do not yet faithfully inherit every user context field that can affect predicate and assignment evaluation.
 5. Schema changes during execution can invalidate planned ranges or statement builders.
 6. Checkpoint writes add overhead to every chunk.
 

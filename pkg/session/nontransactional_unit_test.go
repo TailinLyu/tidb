@@ -15,8 +15,10 @@
 package session
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
@@ -43,12 +45,31 @@ func TestCheckRangeModeStatementShape(t *testing.T) {
 		{
 			sql: "batch on a limit 1 update t set b = b + 1",
 		},
+		{
+			sql:        "batch on a limit 1 update t set b = b + 1 where a <= @upper_bound",
+			errContain: "range mode doesn't support user variables",
+		},
+		{
+			sql:        "batch on a limit 1 update t set b = @@sql_mode",
+			errContain: "range mode doesn't support user variables",
+		},
+		{
+			sql:        "batch on a limit 1 update t set b = connection_id()",
+			errContain: "session-local functions",
+		},
+		{
+			sql:        "batch on a limit 1 update t set b = last_insert_id()",
+			errContain: "session-local functions",
+		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.sql, func(t *testing.T) {
 			stmt := parseNonTransactionalDML(t, tt.sql)
 			err := checkRangeModeStatementShape(stmt)
+			if err == nil {
+				err = checkRangeModeConstraint(stmt, nil, nil, nil, []*ast.TableSource{{}})
+			}
 			if tt.errContain != "" {
 				require.ErrorContains(t, err, tt.errContain)
 				return
@@ -56,6 +77,13 @@ func TestCheckRangeModeStatementShape(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestNonTransactionalDMLRangeRetryableError(t *testing.T) {
+	require.False(t, isNonTransactionalDMLRangeRetryableError(nil))
+	require.False(t, isNonTransactionalDMLRangeRetryableError(errors.New("check constraint failed")))
+	require.True(t, isNonTransactionalDMLRangeRetryableError(errors.New(nonTransactionalDMLRangeInjectedErrMsg)))
+	require.True(t, isNonTransactionalDMLRangeRetryableError(kv.ErrTxnRetryable.GenWithStackByArgs()))
 }
 
 func TestBuildNonTransactionalDMLRangeChunkSQLAddsHandleBounds(t *testing.T) {

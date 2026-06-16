@@ -391,6 +391,17 @@ func TestNonTransactionalDMLRangeModeRejectsUnsupportedShapes(t *testing.T) {
 
 	err = tk.ExecToErr("batch on a limit 1 update t set a = a + 10")
 	require.ErrorContains(t, err, "shard column cannot be updated")
+
+	tk.MustExec("set @upper_bound = 2")
+	err = tk.ExecToErr("batch on a limit 1 update t set b = b + 10 where a <= @upper_bound")
+	require.ErrorContains(t, err, "range mode doesn't support user variables")
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows("1 1", "2 2"))
+
+	err = tk.ExecToErr("batch on a limit 1 update t set b = @@sql_mode where a <= 2")
+	require.ErrorContains(t, err, "range mode doesn't support user variables")
+
+	err = tk.ExecToErr("batch on a limit 1 update t set b = connection_id() where a <= 2")
+	require.ErrorContains(t, err, "session-local functions")
 }
 
 func TestNonTransactionalDMLRangeModeDeleteAndUpdate(t *testing.T) {
