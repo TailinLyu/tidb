@@ -813,8 +813,7 @@ func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessionty
 		worker.AuthWithoutVerification(&user)
 	}
 	workerVars.ActiveRoles = append(workerVars.ActiveRoles[:0], parentVars.ActiveRoles...)
-	workerVars.SetResourceGroupName(parentVars.ResourceGroupName)
-	workerVars.StmtCtx.ResourceGroupName = parentVars.StmtCtx.ResourceGroupName
+	applyNonTransactionalDMLWorkerResourceGroup(workerVars, parentVars.ResourceGroupName, parentVars.StmtCtx.ResourceGroupName)
 	if err := applyNonTransactionalDMLWorkerSysVars(workerVars, collectNonTransactionalDMLWorkerSysVars(parentVars)); err != nil {
 		return err
 	}
@@ -822,6 +821,16 @@ func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessionty
 		return nil
 	}
 	return executeInternalNoResult(ctx, worker, "USE %n", currentDB)
+}
+
+func applyNonTransactionalDMLWorkerResourceGroup(workerVars *variable.SessionVars, resourceGroupName string, stmtResourceGroupName string) {
+	if resourceGroupName != "" {
+		workerVars.SetResourceGroupName(resourceGroupName)
+	}
+	if stmtResourceGroupName == "" {
+		stmtResourceGroupName = workerVars.ResourceGroupName
+	}
+	workerVars.StmtCtx.ResourceGroupName = stmtResourceGroupName
 }
 
 var nonTransactionalDMLWorkerSysVarNames = []string{

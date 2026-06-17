@@ -52,20 +52,22 @@ type nonTransactionalDMLColumnNameMeta struct {
 }
 
 type nonTransactionalDMLTaskMeta struct {
-	JobID            string                            `json:"job_id"`
-	ExecutableDML    string                            `json:"executable_dml"`
-	DisplayDML       string                            `json:"display_dml"`
-	CurrentDB        string                            `json:"current_db"`
-	DBName           string                            `json:"db_name"`
-	TableName        string                            `json:"table_name"`
-	TableID          int64                             `json:"table_id"`
-	FromSQL          string                            `json:"from_sql"`
-	HandleExprSQL    string                            `json:"handle_expr_sql"`
-	HandleColumn     nonTransactionalDMLColumnNameMeta `json:"handle_column"`
-	OriginalWhereSQL string                            `json:"original_where_sql"`
-	BatchSize        int                               `json:"batch_size"`
-	SysVars          map[string]string                 `json:"sys_vars,omitempty"`
-	Ranges           []nonTransactionalDMLSubtaskMeta  `json:"ranges,omitempty"`
+	JobID             string                            `json:"job_id"`
+	ExecutableDML     string                            `json:"executable_dml"`
+	DisplayDML        string                            `json:"display_dml"`
+	CurrentDB         string                            `json:"current_db"`
+	DBName            string                            `json:"db_name"`
+	TableName         string                            `json:"table_name"`
+	TableID           int64                             `json:"table_id"`
+	FromSQL           string                            `json:"from_sql"`
+	HandleExprSQL     string                            `json:"handle_expr_sql"`
+	HandleColumn      nonTransactionalDMLColumnNameMeta `json:"handle_column"`
+	OriginalWhereSQL  string                            `json:"original_where_sql"`
+	BatchSize         int                               `json:"batch_size"`
+	SysVars           map[string]string                 `json:"sys_vars,omitempty"`
+	ResourceGroup     string                            `json:"resource_group,omitempty"`
+	StmtResourceGroup string                            `json:"stmt_resource_group,omitempty"`
+	Ranges            []nonTransactionalDMLSubtaskMeta  `json:"ranges,omitempty"`
 }
 
 type nonTransactionalDMLSubtaskMeta struct {
@@ -187,19 +189,21 @@ func buildNonTransactionalDMLTaskMeta(rangeCtx *nonTransactionalDMLRangeContext,
 		return nil, err
 	}
 	return &nonTransactionalDMLTaskMeta{
-		JobID:            rangeCtx.jobID,
-		ExecutableDML:    executableDML,
-		DisplayDML:       redact.String(se.GetSessionVars().EnableRedactLog, executableDML),
-		CurrentDB:        rangeCtx.currentDB,
-		DBName:           rangeCtx.dbName,
-		TableName:        rangeCtx.tableName,
-		TableID:          rangeCtx.tableInfo.ID,
-		FromSQL:          rangeCtx.fromSQL,
-		HandleExprSQL:    rangeCtx.handleExprSQL,
-		HandleColumn:     nonTransactionalDMLColumnNameMetaFromAST(rangeCtx.handleColumn),
-		OriginalWhereSQL: rangeCtx.originalWhereSQL,
-		BatchSize:        batchSize,
-		SysVars:          collectNonTransactionalDMLWorkerSysVars(se.GetSessionVars()),
+		JobID:             rangeCtx.jobID,
+		ExecutableDML:     executableDML,
+		DisplayDML:        redact.String(se.GetSessionVars().EnableRedactLog, executableDML),
+		CurrentDB:         rangeCtx.currentDB,
+		DBName:            rangeCtx.dbName,
+		TableName:         rangeCtx.tableName,
+		TableID:           rangeCtx.tableInfo.ID,
+		FromSQL:           rangeCtx.fromSQL,
+		HandleExprSQL:     rangeCtx.handleExprSQL,
+		HandleColumn:      nonTransactionalDMLColumnNameMetaFromAST(rangeCtx.handleColumn),
+		OriginalWhereSQL:  rangeCtx.originalWhereSQL,
+		BatchSize:         batchSize,
+		SysVars:           collectNonTransactionalDMLWorkerSysVars(se.GetSessionVars()),
+		ResourceGroup:     se.GetSessionVars().ResourceGroupName,
+		StmtResourceGroup: se.GetSessionVars().StmtCtx.ResourceGroupName,
 	}, nil
 }
 
@@ -361,6 +365,7 @@ func (e *nonTransactionalDMLStepExecutor) RealtimeSummary() *execute.SubtaskSumm
 
 func (e *nonTransactionalDMLStepExecutor) runSubtaskWithSession(ctx context.Context, se sessiontypes.Session,
 	subtaskMeta *nonTransactionalDMLSubtaskMeta, scanned *uint64, affected *uint64) error {
+	applyNonTransactionalDMLWorkerResourceGroup(se.GetSessionVars(), e.taskMeta.ResourceGroup, e.taskMeta.StmtResourceGroup)
 	if err := applyNonTransactionalDMLWorkerSysVars(se.GetSessionVars(), e.taskMeta.SysVars); err != nil {
 		return err
 	}

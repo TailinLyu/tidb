@@ -15,6 +15,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"math"
 	"testing"
@@ -23,7 +24,12 @@ import (
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/planner/core/resolve"
+	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,6 +121,66 @@ func TestBuildNonTransactionalDMLRangeChunkSQLAddsHandleBounds(t *testing.T) {
 	require.Contains(t, sql, "`b` < 10")
 }
 
+func TestApplyNonTransactionalDMLWorkerResourceGroup(t *testing.T) {
+	vars := variable.NewSessionVars(nil)
+	vars.SetResourceGroupName("default")
+	vars.StmtCtx.ResourceGroupName = "default"
+
+	applyNonTransactionalDMLWorkerResourceGroup(vars, "rg_session", "rg_stmt")
+	require.Equal(t, "rg_session", vars.ResourceGroupName)
+	require.Equal(t, "rg_stmt", vars.StmtCtx.ResourceGroupName)
+
+	applyNonTransactionalDMLWorkerResourceGroup(vars, "", "")
+	require.Equal(t, "rg_session", vars.ResourceGroupName)
+	require.Equal(t, "rg_session", vars.StmtCtx.ResourceGroupName)
+}
+
+func TestNonTransactionalDMLDXFRunSubtaskResumesFromCheckpoint(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	defer func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	}()
+	se := CreateSessionAndSetID(t, store)
+
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t(a int primary key clustered, b int)")
+	const rowCount = 30
+	for i := 1; i <= rowCount; i++ {
+		MustExec(t, se, "insert into t values (?, ?)", i, i)
+	}
+
+	taskMeta, subtaskMeta := buildTestNonTransactionalDMLTaskMeta(t, se,
+		"batch on a limit 1 update t set b = b + 1 where a <= 30", rowCount)
+	executor := &nonTransactionalDMLStepExecutor{taskMeta: taskMeta}
+
+	runFirstNonTransactionalDMLDXFChunk(t, taskMeta, subtaskMeta, se)
+
+	checkpoint, err := loadNonTransactionalDMLRangeCheckpoint(
+		kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, taskMeta.JobID, subtaskMeta.RangeID)
+	require.NoError(t, err)
+	require.Equal(t, "done", checkpoint.status)
+	require.NotNil(t, checkpoint.checkpoint)
+	require.Equal(t, uint64(1), checkpoint.scanned)
+	require.Equal(t, uint64(1), checkpoint.affected)
+
+	resumeSe := CreateSessionAndSetID(t, store)
+	MustExec(t, resumeSe, "use test")
+	var scanned uint64
+	var affected uint64
+	require.NoError(t, executor.runSubtaskWithSession(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
+		resumeSe, subtaskMeta, &scanned, &affected))
+
+	rows := mustRows(t, se, "select count(*) from t where b = a + 1")
+	require.Equal(t, int64(rowCount), rows[0].GetInt64(0))
+	rows = mustRows(t, se, "select scanned, affected, status from mysql.tidb_nontransactional_dml_checkpoint where job_id = ? and range_id = ?",
+		taskMeta.JobID, subtaskMeta.RangeID)
+	require.Equal(t, int64(rowCount), rows[0].GetInt64(0))
+	require.Equal(t, int64(rowCount), rows[0].GetInt64(1))
+	require.Equal(t, "done", rows[0].GetString(2))
+}
+
 func TestSplitNonTransactionalDMLSignedHandleRange(t *testing.T) {
 	ranges := splitNonTransactionalDMLSignedHandleRange(1, 6, 2)
 	require.Len(t, ranges, 2)
@@ -149,4 +215,63 @@ func parseNonTransactionalDML(t *testing.T, sql string) *ast.NonTransactionalDML
 	stmt, ok := node.(*ast.NonTransactionalDMLStmt)
 	require.True(t, ok)
 	return stmt
+}
+
+func buildTestNonTransactionalDMLTaskMeta(t *testing.T, se sessiontypes.Session, sql string, rangeEnd int64) (*nonTransactionalDMLTaskMeta, *nonTransactionalDMLSubtaskMeta) {
+	t.Helper()
+
+	stmt := parseNonTransactionalDML(t, sql)
+	ctx := context.Background()
+	nodeW := resolve.NewNodeW(stmt)
+	require.NoError(t, core.Preprocess(ctx, se, nodeW))
+	tableName, _, shardColumnInfo, tableSources, err := buildSelectSQL(stmt, nodeW.GetResolveContext(), se)
+	require.NoError(t, err)
+	require.NotNil(t, tableName)
+	tnW := nodeW.GetResolveContext().GetTableName(tableName)
+	require.NotNil(t, tnW)
+	rangeCtx, err := buildNonTransactionalDMLRangeContext(stmt, se, tnW, tableName, shardColumnInfo, tableSources)
+	require.NoError(t, err)
+	taskMeta, err := buildNonTransactionalDMLTaskMeta(rangeCtx, se, int(stmt.Limit))
+	require.NoError(t, err)
+	taskMeta.JobID = "test-dxf-resume"
+	return taskMeta, &nonTransactionalDMLSubtaskMeta{
+		RangeID:  1,
+		RangeEnd: &rangeEnd,
+	}
+}
+
+func runFirstNonTransactionalDMLDXFChunk(t *testing.T, taskMeta *nonTransactionalDMLTaskMeta,
+	subtaskMeta *nonTransactionalDMLSubtaskMeta, se sessiontypes.Session) {
+	t.Helper()
+
+	rangeCtx, err := buildNonTransactionalDMLRangeContextFromTaskMeta(taskMeta)
+	require.NoError(t, err)
+	handles, err := selectNextNonTransactionalDMLRangeHandles(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask), rangeCtx, se, subtaskMeta.RangeStart, subtaskMeta.RangeEnd, taskMeta.BatchSize)
+	require.NoError(t, err)
+	require.Len(t, handles, 1)
+	sql, err := buildNonTransactionalDMLRangeChunkSQL(rangeCtx, subtaskMeta.RangeStart, handles[0])
+	require.NoError(t, err)
+	result := executeNonTransactionalDMLRangeChunkWithRetry(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask), rangeCtx, se, nonTransactionalDMLRangeChunk{
+			jobID:   taskMeta.JobID,
+			rangeID: subtaskMeta.RangeID,
+			end:     handles[0],
+			size:    len(handles),
+			sql:     sql,
+		})
+	require.NoError(t, result.err)
+	require.Equal(t, uint64(1), result.affected)
+}
+
+func mustRows(t *testing.T, se sessiontypes.Session, sql string, args ...any) []chunk.Row {
+	t.Helper()
+	rs := MustExecToRecodeSet(t, se, sql, args...)
+	defer func() {
+		require.NoError(t, rs.Close())
+	}()
+	rows, err := GetRows4Test(context.Background(), se, rs)
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+	return rows
 }

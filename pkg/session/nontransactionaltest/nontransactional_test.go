@@ -501,6 +501,78 @@ func TestNonTransactionalDMLDXFModeDeleteAndUpdate(t *testing.T) {
 		Check(testkit.Rows("4"))
 }
 
+func TestNonTransactionalDMLDXFModePropagatesResourceGroup(t *testing.T) {
+	c := testutil.NewTestDXFContext(t, 0, 16, true)
+	c.ScaleOutBy(":5200", true)
+	tk := testkit.NewTestKit(t, c.Store)
+
+	tk.MustExec("use test")
+	tk.MustExec("create resource group rg_ntdml ru_per_sec=1000")
+	tk.MustExec("set resource group rg_ntdml")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='dxf'")
+	tk.MustExec("set @@tidb_nontransactional_dml_concurrency=1")
+	tk.MustExec("create table t(a int primary key clustered, b int)")
+	for i := 1; i <= 4; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
+	}
+
+	tk.MustQuery("batch on a limit 2 update t set b = b + 1 where a <= 4").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery(`select json_unquote(json_extract(cast(meta as char), '$.resource_group')),
+		json_unquote(json_extract(cast(meta as char), '$.stmt_resource_group')) from (
+		select meta, type, state from mysql.tidb_global_task
+		union all
+		select meta, type, state from mysql.tidb_global_task_history
+	) tasks where type = 'NonTransactionalDML' and state = 'succeed'`).Check(testkit.Rows("rg_ntdml rg_ntdml"))
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
+		"1 2", "2 3", "3 4", "4 5",
+	))
+}
+
+func TestNonTransactionalDMLDXFModeConcurrencyAndMultiRun(t *testing.T) {
+	c := testutil.NewTestDXFContext(t, 0, 16, true)
+	c.ScaleOutBy(":5300", true)
+	c.ScaleOutBy(":5301", false)
+	tk := testkit.NewTestKit(t, c.Store)
+
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='dxf'")
+	tk.MustExec("set @@tidb_nontransactional_dml_concurrency=2")
+	tk.MustExec("create table t(a int primary key clustered, b int)")
+	for i := 1; i <= 8; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
+	}
+
+	tk.MustQuery("batch on a limit 2 update t set b = b + 10 where a <= 8").
+		Check(testkit.Rows("2 all succeeded"))
+
+	tk.MustExec("set @@tidb_nontransactional_dml_concurrency=1")
+	tk.MustQuery("batch on a limit 4 update t set b = b + 1 where a <= 4").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
+		"1 12", "2 13", "3 14", "4 15", "5 15", "6 16", "7 17", "8 18",
+	))
+	tk.MustQuery(`select count(*), count(distinct task_key) from (
+		select task_key, type, state from mysql.tidb_global_task
+		union all
+		select task_key, type, state from mysql.tidb_global_task_history
+	) tasks where type = 'NonTransactionalDML' and state = 'succeed'`).Check(testkit.Rows("2 2"))
+	tk.MustQuery(`select task_concurrency, count(*) from (
+		select t.concurrency as task_concurrency, s.id from (
+			select id, type, state, concurrency from mysql.tidb_global_task
+			union all
+			select id, type, state, concurrency from mysql.tidb_global_task_history
+		) t join (
+			select task_key, id from mysql.tidb_background_subtask
+			union all
+			select task_key, id from mysql.tidb_background_subtask_history
+		) s on cast(t.id as char) = s.task_key
+		where t.type = 'NonTransactionalDML' and t.state = 'succeed'
+	) subtasks group by task_concurrency order by task_concurrency`).Check(testkit.Rows("1 1", "2 2"))
+	tk.MustQuery("select count(distinct job_id) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't'").
+		Check(testkit.Rows("2"))
+}
+
 func TestNonTransactionalDMLWorkWithForeignKey(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)
