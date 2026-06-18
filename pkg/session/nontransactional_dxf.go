@@ -42,8 +42,10 @@ import (
 	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/redact"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
+	"go.uber.org/zap"
 )
 
 type nonTransactionalDMLColumnNameMeta struct {
@@ -123,6 +125,12 @@ func registerNonTransactionalDMLDXFTask() {
 			return executor
 		},
 	)
+	scheduler.RegisterSchedulerCleanUpFactory(
+		proto.NonTransactionalDML,
+		func() scheduler.CleanUpRoutine {
+			return &nonTransactionalDMLCleanUp{}
+		},
+	)
 }
 
 func handleNonTransactionalDMLByDXF(ctx context.Context, stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
@@ -172,6 +180,13 @@ func handleNonTransactionalDMLByDXF(ctx context.Context, stmt *ast.NonTransactio
 	if err != nil {
 		return nil, err
 	}
+	logutil.Logger(ctx).Info("Non-transactional DML DXF task submitted",
+		zap.Int64("task-id", task.ID),
+		zap.String("job-id", taskMeta.JobID),
+		zap.String("current-db", taskMeta.CurrentDB),
+		zap.String("table", taskMeta.TableName),
+		zap.Int("concurrency", concurrency),
+		zap.String("dml", taskMeta.DisplayDML))
 	if err := handle.WaitTaskDoneOrPaused(taskCtx, task.ID); err != nil {
 		return nil, err
 	}
@@ -182,7 +197,24 @@ func handleNonTransactionalDMLByDXF(ctx context.Context, stmt *ast.NonTransactio
 	if finishedTask.State != proto.TaskStateSucceed {
 		return nil, errors.Errorf("Non-transactional DML DXF task stopped with state %s", finishedTask.State)
 	}
-	return buildNonTransactionalDMLDXFResults(taskCtx, se, taskMeta.JobID)
+	finishedMeta, err := unmarshalNonTransactionalDMLTaskMeta(finishedTask.Meta)
+	if err != nil {
+		return nil, err
+	}
+	summary, summaryErr := summarizeNonTransactionalDMLRangeCheckpoints(taskCtx, se, finishedMeta.JobID)
+	if summaryErr != nil {
+		return nil, summaryErr
+	}
+	logutil.Logger(ctx).Info("Non-transactional DML DXF task finished",
+		zap.Int64("task-id", finishedTask.ID),
+		zap.String("job-id", finishedMeta.JobID),
+		zap.Stringer("state", finishedTask.State),
+		zap.Int64("checkpoint-total", summary.total),
+		zap.Int64("checkpoint-done", summary.done),
+		zap.Int64("checkpoint-failed", summary.failed),
+		zap.Uint64("scanned", summary.scanned),
+		zap.Uint64("affected", summary.affected))
+	return buildNonTransactionalDMLDXFResults(taskCtx, se, finishedMeta)
 }
 
 func buildNonTransactionalDMLTaskMeta(rangeCtx *nonTransactionalDMLRangeContext,
@@ -236,15 +268,14 @@ func restoreNonTransactionalDMLExecutableDML(stmt ast.StmtNode) (string, error) 
 	return sb.String(), nil
 }
 
-func buildNonTransactionalDMLDXFResults(ctx context.Context, se sessiontypes.Session, jobID string) (sqlexec.RecordSet, error) {
-	rows, err := sqlexec.ExecSQL(ctx, se, `SELECT COUNT(*) FROM mysql.tidb_nontransactional_dml_checkpoint
-		WHERE job_id = %? AND status = 'done'`, jobID)
+func buildNonTransactionalDMLDXFResults(ctx context.Context, se sessiontypes.Session, taskMeta *nonTransactionalDMLTaskMeta) (sqlexec.RecordSet, error) {
+	summary, err := summarizeNonTransactionalDMLRangeCheckpoints(ctx, se, taskMeta.JobID)
 	if err != nil {
 		return nil, err
 	}
-	jobCount := 0
-	if len(rows) > 0 {
-		jobCount = int(rows[0].GetInt64(0))
+	jobCount := int(summary.done)
+	if summary.total == 0 && len(taskMeta.Ranges) > 0 {
+		jobCount = len(taskMeta.Ranges)
 	}
 	jobs := make([]job, 0, jobCount)
 	for i := 1; i <= jobCount; i++ {
@@ -317,6 +348,46 @@ func (s *nonTransactionalDMLScheduler) ModifyMeta(oldMeta []byte, _ []proto.Modi
 	return oldMeta, nil
 }
 
+type nonTransactionalDMLCleanUp struct{}
+
+func (*nonTransactionalDMLCleanUp) CleanUp(ctx context.Context, task *proto.Task) error {
+	taskMgr, err := storage.GetTaskManager()
+	if err != nil {
+		return err
+	}
+	return taskMgr.WithNewSession(func(ctxSe sessionctx.Context) error {
+		se, ok := ctxSe.(sessiontypes.Session)
+		if !ok {
+			return errors.New("Non-transactional DML DXF cleanup requires a session executor")
+		}
+		return cleanupNonTransactionalDMLDXFCheckpoints(kv.WithInternalSourceType(ctx, kv.InternalDistTask), se, task)
+	})
+}
+
+func cleanupNonTransactionalDMLDXFCheckpoints(ctx context.Context, se sessiontypes.Session, task *proto.Task) error {
+	taskMeta, err := unmarshalNonTransactionalDMLTaskMeta(task.Meta)
+	if err != nil {
+		return err
+	}
+	summary, err := summarizeNonTransactionalDMLRangeCheckpoints(ctx, se, taskMeta.JobID)
+	if err != nil {
+		return err
+	}
+	logutil.Logger(ctx).Info("Non-transactional DML DXF checkpoint cleanup inspected task",
+		zap.Int64("task-id", task.ID),
+		zap.String("job-id", taskMeta.JobID),
+		zap.Stringer("state", task.State),
+		zap.Int64("checkpoint-total", summary.total),
+		zap.Int64("checkpoint-done", summary.done),
+		zap.Int64("checkpoint-failed", summary.failed),
+		zap.Uint64("scanned", summary.scanned),
+		zap.Uint64("affected", summary.affected))
+	if task.State != proto.TaskStateSucceed {
+		return nil
+	}
+	return deleteNonTransactionalDMLRangeCheckpoints(ctx, se, taskMeta.JobID)
+}
+
 func (e *nonTransactionalDMLTaskExecutor) IsIdempotent(*proto.Subtask) bool {
 	return true
 }
@@ -381,9 +452,21 @@ func (e *nonTransactionalDMLStepExecutor) runSubtaskWithSession(ctx context.Cont
 	if err != nil {
 		return err
 	}
+	logutil.Logger(ctx).Info("Non-transactional DML DXF subtask started",
+		zap.String("job-id", e.taskMeta.JobID),
+		zap.Int64("range-id", subtaskMeta.RangeID),
+		zap.Any("range-start", subtaskMeta.RangeStart),
+		zap.Any("range-end", subtaskMeta.RangeEnd))
 	if checkpoint.status == "failed" {
 		if !isNonTransactionalDMLRangeRetryableError(errors.New(checkpoint.errText)) {
 			return errors.Errorf("Non-transactional DML DXF range %d has failed checkpoint: %s", subtaskMeta.RangeID, checkpoint.errText)
+		}
+		logutil.Logger(ctx).Info("Non-transactional DML DXF ignores retryable failed checkpoint",
+			zap.String("job-id", e.taskMeta.JobID),
+			zap.Int64("range-id", subtaskMeta.RangeID),
+			zap.String("error", checkpoint.errText))
+		if err := deleteNonTransactionalDMLRangeCheckpoint(ctx, se, e.taskMeta.JobID, subtaskMeta.RangeID); err != nil {
+			return err
 		}
 		checkpoint = nonTransactionalDMLRangeCheckpoint{}
 	}
@@ -394,6 +477,12 @@ func (e *nonTransactionalDMLStepExecutor) runSubtaskWithSession(ctx context.Cont
 		*affected = checkpoint.affected
 		subtaskMeta.Checkpoint = checkpoint.checkpoint
 		e.scanned.Store(*scanned)
+		logutil.Logger(ctx).Info("Non-transactional DML DXF subtask resumed from checkpoint",
+			zap.String("job-id", e.taskMeta.JobID),
+			zap.Int64("range-id", subtaskMeta.RangeID),
+			zap.Int64("checkpoint", *checkpoint.checkpoint),
+			zap.Uint64("scanned", *scanned),
+			zap.Uint64("affected", *affected))
 	}
 	for {
 		handles, err := selectNextNonTransactionalDMLRangeHandles(ctx, rangeCtx, se, start, subtaskMeta.RangeEnd, e.taskMeta.BatchSize)
@@ -427,6 +516,14 @@ func (e *nonTransactionalDMLStepExecutor) runSubtaskWithSession(ctx context.Cont
 		e.scanned.Store(*scanned)
 		subtaskMeta.Checkpoint = &end
 		start = &end
+		logutil.Logger(ctx).Info("Non-transactional DML DXF subtask checkpoint advanced",
+			zap.String("job-id", e.taskMeta.JobID),
+			zap.Int64("range-id", subtaskMeta.RangeID),
+			zap.Int64("checkpoint", end),
+			zap.Int("chunk-size", len(handles)),
+			zap.Uint64("chunk-affected", result.affected),
+			zap.Uint64("scanned", *scanned),
+			zap.Uint64("affected", *affected))
 	}
 }
 

@@ -340,6 +340,119 @@ func TestNonTransactionalDMLDXFTaskMetaAndWorkerPreserveSubmitterIdentity(t *tes
 	require.Equal(t, "%", workerSe.GetSessionVars().ActiveRoles[0].Hostname)
 }
 
+func TestNonTransactionalDMLDXFCheckpointSummaryCleanupAndResultFallback(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	defer func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	}()
+	se := CreateSessionAndSetID(t, store)
+
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t(a int primary key clustered, b int)")
+	MustExec(t, se, "insert into t values (1, 1), (2, 2), (3, 3)")
+	taskMeta, _ := buildTestNonTransactionalDMLTaskMeta(t, se,
+		"batch on a limit 2 update t set b = b + 1 where a <= 3", 3)
+	taskMeta.Ranges = []nonTransactionalDMLSubtaskMeta{
+		{RangeID: 1},
+		{RangeID: 2},
+	}
+	rangeCtx, err := buildNonTransactionalDMLRangeContextFromTaskMeta(taskMeta)
+	require.NoError(t, err)
+	require.NoError(t, writeNonTransactionalDMLRangeCheckpoint(
+		kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers),
+		rangeCtx,
+		se,
+		nonTransactionalDMLRangeChunk{jobID: taskMeta.JobID, rangeID: 1, end: 2, size: 2},
+		"done",
+		2,
+		nil,
+	))
+	require.NoError(t, writeNonTransactionalDMLRangeCheckpoint(
+		kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers),
+		rangeCtx,
+		se,
+		nonTransactionalDMLRangeChunk{jobID: taskMeta.JobID, rangeID: 2, end: 3, size: 1},
+		"done",
+		1,
+		nil,
+	))
+
+	summary, err := summarizeNonTransactionalDMLRangeCheckpoints(
+		kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, taskMeta.JobID)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), summary.total)
+	require.Equal(t, int64(2), summary.done)
+	require.Equal(t, int64(0), summary.failed)
+	require.Equal(t, uint64(3), summary.scanned)
+	require.Equal(t, uint64(3), summary.affected)
+
+	metaBytes, err := json.Marshal(taskMeta)
+	require.NoError(t, err)
+	require.NoError(t, cleanupNonTransactionalDMLDXFCheckpoints(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
+		se,
+		&proto.Task{
+			TaskBase: proto.TaskBase{State: proto.TaskStateSucceed},
+			Meta:     metaBytes,
+		},
+	))
+	rows := mustRows(t, se, "select count(*) from mysql.tidb_nontransactional_dml_checkpoint where job_id = ?", taskMeta.JobID)
+	require.Equal(t, int64(0), rows[0].GetInt64(0))
+
+	rs, err := buildNonTransactionalDMLDXFResults(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask), se, taskMeta)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, rs.Close())
+	}()
+	resultRows, err := GetRows4Test(context.Background(), se, rs)
+	require.NoError(t, err)
+	require.Len(t, resultRows, 1)
+	require.Equal(t, int64(2), resultRows[0].GetInt64(0))
+	require.Equal(t, "all succeeded", resultRows[0].GetString(1))
+}
+
+func TestNonTransactionalDMLDXFCleanupPreservesFailedCheckpoints(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	defer func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	}()
+	se := CreateSessionAndSetID(t, store)
+
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t(a int primary key clustered, b int)")
+	MustExec(t, se, "insert into t values (1, 1)")
+	taskMeta, _ := buildTestNonTransactionalDMLTaskMeta(t, se,
+		"batch on a limit 1 update t set b = b + 1 where a = 1", 1)
+	rangeCtx, err := buildNonTransactionalDMLRangeContextFromTaskMeta(taskMeta)
+	require.NoError(t, err)
+	require.NoError(t, writeNonTransactionalDMLRangeCheckpoint(
+		kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers),
+		rangeCtx,
+		se,
+		nonTransactionalDMLRangeChunk{jobID: taskMeta.JobID, rangeID: 1, end: 1, size: 1},
+		"failed",
+		0,
+		errors.New("permanent failure"),
+	))
+
+	metaBytes, err := json.Marshal(taskMeta)
+	require.NoError(t, err)
+	require.NoError(t, cleanupNonTransactionalDMLDXFCheckpoints(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
+		se,
+		&proto.Task{
+			TaskBase: proto.TaskBase{State: proto.TaskStateFailed},
+			Meta:     metaBytes,
+		},
+	))
+	rows := mustRows(t, se, "select status, error from mysql.tidb_nontransactional_dml_checkpoint where job_id = ?", taskMeta.JobID)
+	require.Equal(t, "failed", rows[0].GetString(0))
+	require.Contains(t, rows[0].GetString(1), "permanent failure")
+}
+
 func TestSplitNonTransactionalDMLSignedHandleRange(t *testing.T) {
 	ranges := splitNonTransactionalDMLSignedHandleRange(1, 6, 2)
 	require.Len(t, ranges, 2)

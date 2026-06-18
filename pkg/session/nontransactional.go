@@ -1153,6 +1153,39 @@ type nonTransactionalDMLRangeCheckpoint struct {
 	errText    string
 }
 
+type nonTransactionalDMLCheckpointSummary struct {
+	total    int64
+	done     int64
+	failed   int64
+	scanned  uint64
+	affected uint64
+}
+
+func summarizeNonTransactionalDMLRangeCheckpoints(ctx context.Context, se sessiontypes.Session, jobID string) (nonTransactionalDMLCheckpointSummary, error) {
+	rows, err := sqlexec.ExecSQL(ctx, se, `SELECT CAST(COUNT(*) AS SIGNED),
+			CAST(COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS SIGNED),
+			CAST(COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS SIGNED),
+			CAST(COALESCE(SUM(scanned), 0) AS UNSIGNED),
+			CAST(COALESCE(SUM(affected), 0) AS UNSIGNED)
+		FROM mysql.tidb_nontransactional_dml_checkpoint
+		WHERE job_id = %?`,
+		jobID,
+	)
+	if err != nil {
+		return nonTransactionalDMLCheckpointSummary{}, err
+	}
+	if len(rows) == 0 {
+		return nonTransactionalDMLCheckpointSummary{}, nil
+	}
+	return nonTransactionalDMLCheckpointSummary{
+		total:    rows[0].GetInt64(0),
+		done:     rows[0].GetInt64(1),
+		failed:   rows[0].GetInt64(2),
+		scanned:  rows[0].GetUint64(3),
+		affected: rows[0].GetUint64(4),
+	}, nil
+}
+
 func loadNonTransactionalDMLRangeCheckpoint(ctx context.Context, se sessiontypes.Session, jobID string, rangeID int64) (nonTransactionalDMLRangeCheckpoint, error) {
 	rows, err := sqlexec.ExecSQL(ctx, se, `SELECT checkpoint, status, scanned, affected, error FROM mysql.tidb_nontransactional_dml_checkpoint
 		WHERE job_id = %? AND range_id = %?`,
@@ -1176,6 +1209,21 @@ func loadNonTransactionalDMLRangeCheckpoint(ctx context.Context, se sessiontypes
 		loaded.errText = rows[0].GetString(4)
 	}
 	return loaded, nil
+}
+
+func deleteNonTransactionalDMLRangeCheckpoint(ctx context.Context, se sessiontypes.Session, jobID string, rangeID int64) error {
+	return executeInternalNoResult(ctx, se, `DELETE FROM mysql.tidb_nontransactional_dml_checkpoint
+		WHERE job_id = %? AND range_id = %?`,
+		jobID,
+		rangeID,
+	)
+}
+
+func deleteNonTransactionalDMLRangeCheckpoints(ctx context.Context, se sessiontypes.Session, jobID string) error {
+	return executeInternalNoResult(ctx, se, `DELETE FROM mysql.tidb_nontransactional_dml_checkpoint
+		WHERE job_id = %?`,
+		jobID,
+	)
 }
 
 func nonTransactionalDMLRangeCheckpointDone(ctx context.Context, se sessiontypes.Session, chunkJob nonTransactionalDMLRangeChunk) (bool, error) {

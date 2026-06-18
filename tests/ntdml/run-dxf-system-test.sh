@@ -71,7 +71,8 @@ cleanup() {
 		wait "$TIDB2_PID" >/dev/null 2>&1
 	fi
 	docker rm -f "${PREFIX}-tikv" "${PREFIX}-pd" >/dev/null 2>&1
-	rm -f "/tmp/${PREFIX}-tidb1.log" "/tmp/${PREFIX}-tidb2.log" "/tmp/${PREFIX}-dxf-owner.out" "/tmp/${PREFIX}-dxf-executor.out"
+	rm -f "/tmp/${PREFIX}-tidb1.log" "/tmp/${PREFIX}-tidb2.log" \
+		"/tmp/${PREFIX}-dxf-owner.out" "/tmp/${PREFIX}-dxf-executor.out" "/tmp/${PREFIX}-dxf-rolling.out"
 }
 trap cleanup EXIT
 
@@ -143,6 +144,25 @@ wait_for_succeeded_tasks() {
 		sleep 1
 	done
 	echo "timed out waiting for $expected succeeded NonTransactionalDML tasks" >&2
+	exit 1
+}
+
+checkpoint_count() {
+	query_scalar "$TIDB2_PORT" "select count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db='ntdml_system' and table_name='t'"
+}
+
+wait_for_checkpoint_count_at_least() {
+	local expected="$1"
+	local label="$2"
+	for _ in $(seq 1 120); do
+		local count
+		count="$(checkpoint_count)"
+		if [[ "$count" -ge "$expected" ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "timed out waiting for checkpoint progress during ${label}; expected >= ${expected}" >&2
 	exit 1
 }
 
@@ -247,22 +267,25 @@ SELECT COUNT(*) AS loaded_rows, SUM(LENGTH(pad)) AS payload_bytes FROM t;
 SQL
 
 log "starting DXF update and restarting the submitter/owner candidate"
+checkpoint_baseline="$(checkpoint_count)"
 set +e
 mysql_cmd "$TIDB1_PORT" >/tmp/"${PREFIX}-dxf-owner.out" 2>&1 <<SQL &
 USE ntdml_system;
 SET @@tidb_nontransactional_dml_execution_mode='dxf';
 SET @@tidb_nontransactional_dml_concurrency=${CONCURRENCY};
-BATCH ON a LIMIT ${BATCH_SIZE} UPDATE t SET b = b + 1000 + sleep(${SLEEP_SECONDS}) WHERE a BETWEEN 1 AND 50000;
+BATCH ON a LIMIT ${BATCH_SIZE} UPDATE t SET b = 1000 + (a % 1000) + sleep(${SLEEP_SECONDS}) WHERE a BETWEEN 1 AND 50000;
 SQL
 OWNER_CLIENT_PID="$!"
 set -e
 wait_for_task_count 1
+wait_for_checkpoint_count_at_least "$((checkpoint_baseline + 1))" "submitter/owner restart"
 stop_tidb1
 start_tidb1
 wait "$OWNER_CLIENT_PID" || true
 wait_for_succeeded_tasks 1
 
 log "starting DXF delete and restarting the second executor"
+checkpoint_baseline="$(checkpoint_count)"
 set +e
 mysql_cmd "$TIDB1_PORT" >/tmp/"${PREFIX}-dxf-executor.out" 2>&1 <<SQL &
 USE ntdml_system;
@@ -273,15 +296,37 @@ SQL
 EXEC_CLIENT_PID="$!"
 set -e
 wait_for_task_count 2
+wait_for_checkpoint_count_at_least "$((checkpoint_baseline + 1))" "executor restart"
 stop_tidb2
 start_tidb2
 wait "$EXEC_CLIENT_PID" || true
 wait_for_succeeded_tasks 2
 
+log "starting DXF update and rolling restarting both TiDB nodes"
+checkpoint_baseline="$(checkpoint_count)"
+set +e
+mysql_cmd "$TIDB1_PORT" >/tmp/"${PREFIX}-dxf-rolling.out" 2>&1 <<SQL &
+USE ntdml_system;
+SET @@tidb_nontransactional_dml_execution_mode='dxf';
+SET @@tidb_nontransactional_dml_concurrency=${CONCURRENCY};
+BATCH ON a LIMIT ${BATCH_SIZE} UPDATE t SET b = 2000 + (a % 1000) + sleep(${SLEEP_SECONDS}) WHERE a BETWEEN 50001 AND 100000;
+SQL
+ROLLING_CLIENT_PID="$!"
+set -e
+wait_for_task_count 3
+wait_for_checkpoint_count_at_least "$((checkpoint_baseline + 1))" "rolling restart"
+stop_tidb1
+start_tidb1
+stop_tidb2
+start_tidb2
+wait "$ROLLING_CLIENT_PID" || true
+wait_for_succeeded_tasks 3
+
 log "checking data integrity"
 mysql_cmd "$TIDB1_PORT" <<SQL
 USE ntdml_system;
 SELECT COUNT(*) AS updated_rows FROM t WHERE a BETWEEN 1 AND 50000 AND b >= 1000;
+SELECT COUNT(*) AS rolling_updated_rows FROM t WHERE a BETWEEN 50001 AND 100000 AND b >= 2000;
 SELECT COUNT(*) AS deleted_rows FROM t WHERE a BETWEEN 150001 AND 200000;
 SELECT COUNT(*) AS final_rows FROM t;
 SELECT status, COUNT(*) AS checkpoints, SUM(scanned) AS scanned, SUM(affected) AS affected
@@ -291,12 +336,17 @@ GROUP BY status ORDER BY status;
 SQL
 
 updated_rows="$(query_scalar "$TIDB1_PORT" "select count(*) from ntdml_system.t where a between 1 and 50000 and b >= 1000")"
+rolling_updated_rows="$(query_scalar "$TIDB1_PORT" "select count(*) from ntdml_system.t where a between 50001 and 100000 and b >= 2000")"
 deleted_rows="$(query_scalar "$TIDB1_PORT" "select count(*) from ntdml_system.t where a between 150001 and 200000")"
 final_rows="$(query_scalar "$TIDB1_PORT" "select count(*) from ntdml_system.t")"
 done_statuses="$(query_scalar "$TIDB1_PORT" "select count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db='ntdml_system' and table_name='t' and status <> 'done'")"
 
 if [[ "$updated_rows" != "50000" ]]; then
 	echo "expected 50000 updated rows, got $updated_rows" >&2
+	exit 1
+fi
+if [[ "$rolling_updated_rows" != "50000" ]]; then
+	echo "expected 50000 rolling-updated rows, got $rolling_updated_rows" >&2
 	exit 1
 fi
 if [[ "$deleted_rows" != "0" ]]; then

@@ -497,8 +497,20 @@ func TestNonTransactionalDMLDXFModeDeleteAndUpdate(t *testing.T) {
 		union all
 		select type, state from mysql.tidb_global_task_history
 	) tasks where type = 'NonTransactionalDML' and state = 'succeed'`).Check(testkit.Rows("2"))
-	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't' and status = 'done'").
-		Check(testkit.Rows("4"))
+	tk.MustQuery(`select count(*) from (
+		select t.id from (
+			select id, type, state from mysql.tidb_global_task
+			union all
+			select id, type, state from mysql.tidb_global_task_history
+		) t join (
+			select task_key, id from mysql.tidb_background_subtask
+			union all
+			select task_key, id from mysql.tidb_background_subtask_history
+		) s on cast(t.id as char) = s.task_key
+		where t.type = 'NonTransactionalDML' and t.state = 'succeed'
+	) subtasks`).Check(testkit.Rows("4"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't' and status <> 'done'").
+		Check(testkit.Rows("0"))
 }
 
 func TestNonTransactionalDMLDXFModePropagatesResourceGroup(t *testing.T) {
@@ -569,8 +581,8 @@ func TestNonTransactionalDMLDXFModeConcurrencyAndMultiRun(t *testing.T) {
 		) s on cast(t.id as char) = s.task_key
 		where t.type = 'NonTransactionalDML' and t.state = 'succeed'
 	) subtasks group by task_concurrency order by task_concurrency`).Check(testkit.Rows("1 1", "2 2"))
-	tk.MustQuery("select count(distinct job_id) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't'").
-		Check(testkit.Rows("2"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint where current_db = 'test' and table_name = 't' and status <> 'done'").
+		Check(testkit.Rows("0"))
 }
 
 func TestNonTransactionalDMLWorkWithForeignKey(t *testing.T) {
