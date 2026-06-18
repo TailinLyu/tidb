@@ -30,6 +30,32 @@ import (
 	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
+type prometheusCounterCheck struct {
+	metric prometheus.Counter
+	diff   int
+}
+
+func readPrometheusCounter(t *testing.T, counter prometheus.Counter) float64 {
+	var metric dto.Metric
+	require.NoError(t, counter.Write(&metric))
+	return metric.Counter.GetValue()
+}
+
+func readPrometheusCounters(t *testing.T, checks []prometheusCounterCheck) []float64 {
+	counters := make([]float64, len(checks))
+	for i, check := range checks {
+		counters[i] = readPrometheusCounter(t, check.metric)
+	}
+	return counters
+}
+
+func checkPrometheusCounterDiffs(t *testing.T, checks []prometheusCounterCheck, before []float64) {
+	after := readPrometheusCounters(t, checks)
+	for i, check := range checks {
+		require.Equal(t, check.diff, int(after[i]-before[i]+0.001), "metric %s should increase by %d", check.metric.Desc().String(), check.diff)
+	}
+}
+
 func TestNonTransactionalDMLSharding(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)
@@ -425,14 +451,32 @@ func TestNonTransactionalDMLRangeModeDeleteAndUpdate(t *testing.T) {
 		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
 	}
 
+	updateMetricChecks := []prometheusCounterCheck{
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("range", "update", "submitted"), 1},
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("range", "update", metrics.LblOK), 1},
+		{metrics.NonTransactionalDMLChunkCounter.WithLabelValues("range", "update", "done"), 3},
+		{metrics.NonTransactionalDMLRowsCounter.WithLabelValues("range", "update", "scanned"), 6},
+		{metrics.NonTransactionalDMLRowsCounter.WithLabelValues("range", "update", "affected"), 6},
+	}
+	updateBefore := readPrometheusCounters(t, updateMetricChecks)
 	tk.MustQuery("batch on a limit 2 update t set b = b + 10 where a <= 6").
 		Check(testkit.Rows("3 all succeeded"))
+	checkPrometheusCounterDiffs(t, updateMetricChecks, updateBefore)
 	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
 		"1 11", "2 12", "3 13", "4 14", "5 15", "6 16", "7 7", "8 8", "9 9",
 	))
 
+	deleteMetricChecks := []prometheusCounterCheck{
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("range", "delete", "submitted"), 1},
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("range", "delete", metrics.LblOK), 1},
+		{metrics.NonTransactionalDMLChunkCounter.WithLabelValues("range", "delete", "done"), 2},
+		{metrics.NonTransactionalDMLRowsCounter.WithLabelValues("range", "delete", "scanned"), 4},
+		{metrics.NonTransactionalDMLRowsCounter.WithLabelValues("range", "delete", "affected"), 4},
+	}
+	deleteBefore := readPrometheusCounters(t, deleteMetricChecks)
 	tk.MustQuery("batch on a limit 3 delete from t where b >= 13").
 		Check(testkit.Rows("2 all succeeded"))
+	checkPrometheusCounterDiffs(t, deleteMetricChecks, deleteBefore)
 	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
 		"1 11", "2 12", "7 7", "8 8", "9 9",
 	))
@@ -480,14 +524,26 @@ func TestNonTransactionalDMLDXFModeDeleteAndUpdate(t *testing.T) {
 		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
 	}
 
+	updateMetricChecks := []prometheusCounterCheck{
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("dxf", "update", "submitted"), 1},
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("dxf", "update", metrics.LblOK), 1},
+	}
+	updateBefore := readPrometheusCounters(t, updateMetricChecks)
 	tk.MustQuery("batch on a limit 2 update t set b = b + 10 where a <= 6").
 		Check(testkit.Rows("2 all succeeded"))
+	checkPrometheusCounterDiffs(t, updateMetricChecks, updateBefore)
 	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
 		"1 11", "2 12", "3 13", "4 14", "5 15", "6 16", "7 7", "8 8", "9 9",
 	))
 
+	deleteMetricChecks := []prometheusCounterCheck{
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("dxf", "delete", "submitted"), 1},
+		{metrics.NonTransactionalDMLTaskCounter.WithLabelValues("dxf", "delete", metrics.LblOK), 1},
+	}
+	deleteBefore := readPrometheusCounters(t, deleteMetricChecks)
 	tk.MustQuery("batch on a limit 3 delete from t where b >= 13").
 		Check(testkit.Rows("2 all succeeded"))
+	checkPrometheusCounterDiffs(t, deleteMetricChecks, deleteBefore)
 	tk.MustQuery("select a, b from t order by a").Check(testkit.Rows(
 		"1 11", "2 12", "7 7", "8 8", "9 9",
 	))
@@ -642,23 +698,6 @@ func TestNonTransactionalDMLWorkWithForeignKey(t *testing.T) {
 }
 
 func TestNonTransactionalMetrics(t *testing.T) {
-	readCounter := func(counter prometheus.Counter) float64 {
-		var metric dto.Metric
-		require.Nil(t, counter.Write(&metric))
-		return metric.Counter.GetValue()
-	}
-	type checkMetric struct {
-		metric prometheus.Counter
-		diff   int
-	}
-	readCounters := func(checkMetrics []checkMetric) []float64 {
-		counters := make([]float64, len(checkMetrics))
-		for i, cm := range checkMetrics {
-			counters[i] = readCounter(cm.metric)
-		}
-		return counters
-	}
-
 	runAndCheck := func(tp string, fn func()) {
 		var (
 			affectedRowsCounter prometheus.Counter
@@ -680,7 +719,7 @@ func TestNonTransactionalMetrics(t *testing.T) {
 		default:
 			require.Fail(t, "Unknown type of DML", tp)
 		}
-		checkMetrics := []checkMetric{
+		checkMetrics := []prometheusCounterCheck{
 			{affectedRowsCounter, 100},
 			{stmtNodeCounter, 11}, // 1 Select + 10 split DMLs
 			{metrics.AffectedRowsCounterInsert, 0},
@@ -693,12 +732,9 @@ func TestNonTransactionalMetrics(t *testing.T) {
 			{metrics.StmtNodeCounter.WithLabelValues("Update", "", "default"), 0},
 		}
 
-		before := readCounters(checkMetrics)
+		before := readPrometheusCounters(t, checkMetrics)
 		fn()
-		after := readCounters(checkMetrics)
-		for i, cm := range checkMetrics {
-			require.Equal(t, cm.diff, int(after[i]-before[i]+0.001), "metric %s should increase by %d", cm.metric.Desc().String(), cm.diff)
-		}
+		checkPrometheusCounterDiffs(t, checkMetrics, before)
 	}
 
 	store := testkit.CreateMockStore(t)

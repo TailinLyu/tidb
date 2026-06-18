@@ -503,6 +503,8 @@ type nonTransactionalDMLRangeContext struct {
 	originalCondition ast.ExprNode
 	originalWhereSQL  string
 	jobID             string
+	executionMode     string
+	dmlType           string
 }
 
 type nonTransactionalDMLRangeChunk struct {
@@ -524,7 +526,7 @@ const (
 
 func handleNonTransactionalDMLByRange(ctx context.Context, stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
 	resolveCtx *resolve.Context, tableName *ast.TableName, shardColumnInfo *model.ColumnInfo,
-	tableSources []*ast.TableSource) (sqlexec.RecordSet, error) {
+	tableSources []*ast.TableSource) (recordSet sqlexec.RecordSet, retErr error) {
 	if err := checkRangeModeConstraint(stmt, se, tableName, shardColumnInfo, tableSources); err != nil {
 		return nil, err
 	}
@@ -543,11 +545,31 @@ func handleNonTransactionalDMLByRange(ctx context.Context, stmt *ast.NonTransact
 	if err != nil {
 		return nil, err
 	}
+	rangeCtx.executionMode = session_metrics.NonTransactionalDMLModeRange
+	rangeCtx.dmlType = nonTransactionalDMLStmtType(stmt.DMLStmt)
+	session_metrics.NonTransactionalDMLTaskInc(rangeCtx.executionMode, rangeCtx.dmlType, session_metrics.NonTransactionalDMLTaskSubmitted)
+	startTime := time.Now()
+	defer func() {
+		result := metricsResultLabel(retErr)
+		session_metrics.NonTransactionalDMLTaskInc(rangeCtx.executionMode, rangeCtx.dmlType, result)
+		session_metrics.NonTransactionalDMLDurationObserve(rangeCtx.executionMode, rangeCtx.dmlType, result, time.Since(startTime).Seconds())
+	}()
 	jobs, err := runNonTransactionalDMLRange(ctx, rangeCtx, se, int(stmt.Limit))
 	if err != nil {
 		return nil, err
 	}
 	return buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+}
+
+func nonTransactionalDMLStmtType(stmt ast.StmtNode) string {
+	return strings.ToLower(ast.GetStmtLabel(stmt))
+}
+
+func metricsResultLabel(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "error"
 }
 
 func checkRangeModeConstraint(stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
@@ -1037,6 +1059,7 @@ func executeNonTransactionalDMLRangeChunkWithRetry(ctx context.Context, rangeCtx
 		if !retryable || attempt == nonTransactionalDMLRangeMaxRetries {
 			return result
 		}
+		recordNonTransactionalDMLRangeRetryMetric(rangeCtx)
 		timer := time.NewTimer(time.Duration(attempt+1) * nonTransactionalDMLRangeRetryBackoff)
 		select {
 		case <-ctx.Done():
@@ -1052,6 +1075,13 @@ func executeNonTransactionalDMLRangeChunkWithRetry(ctx context.Context, rangeCtx
 		}
 	}
 	return last
+}
+
+func recordNonTransactionalDMLRangeRetryMetric(rangeCtx *nonTransactionalDMLRangeContext) {
+	if rangeCtx == nil || rangeCtx.executionMode == "" || rangeCtx.dmlType == "" {
+		return
+	}
+	session_metrics.NonTransactionalDMLChunkInc(rangeCtx.executionMode, rangeCtx.dmlType, session_metrics.NonTransactionalDMLChunkRetry)
 }
 
 func executeNonTransactionalDMLRangeChunk(ctx context.Context, rangeCtx *nonTransactionalDMLRangeContext,
@@ -1129,7 +1159,7 @@ func writeNonTransactionalDMLRangeCheckpoint(ctx context.Context, rangeCtx *nonT
 	if chunkErr != nil {
 		errText = chunkErr.Error()
 	}
-	return executeInternalNoResult(ctx, se, `REPLACE INTO mysql.tidb_nontransactional_dml_checkpoint
+	if err := executeInternalNoResult(ctx, se, `REPLACE INTO mysql.tidb_nontransactional_dml_checkpoint
 		(job_id, range_id, table_id, current_db, table_name, checkpoint, status, scanned, affected, error)
 		VALUES (%?, %?, %?, %?, %?, %?, %?, %?, %?, %?)`,
 		chunkJob.jobID,
@@ -1142,7 +1172,17 @@ func writeNonTransactionalDMLRangeCheckpoint(ctx context.Context, rangeCtx *nonT
 		chunkJob.scannedBefore+uint64(chunkJob.size),
 		chunkJob.affectedBefore+affectedRows,
 		errText,
-	)
+	); err != nil {
+		return err
+	}
+	if rangeCtx.executionMode != "" && rangeCtx.dmlType != "" {
+		session_metrics.NonTransactionalDMLChunkInc(rangeCtx.executionMode, rangeCtx.dmlType, status)
+		if status == "done" {
+			session_metrics.NonTransactionalDMLRowsAdd(rangeCtx.executionMode, rangeCtx.dmlType, session_metrics.NonTransactionalDMLRowsScanned, uint64(chunkJob.size))
+			session_metrics.NonTransactionalDMLRowsAdd(rangeCtx.executionMode, rangeCtx.dmlType, session_metrics.NonTransactionalDMLRowsAffected, affectedRows)
+		}
+	}
+	return nil
 }
 
 type nonTransactionalDMLRangeCheckpoint struct {

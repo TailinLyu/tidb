@@ -25,6 +25,7 @@ import (
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/disttask/framework/storage"
 	"github.com/pingcap/tidb/pkg/kv"
+	tidbmetrics "github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/auth"
@@ -37,8 +38,16 @@ import (
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
+
+func readTestPrometheusCounter(t *testing.T, counter prometheus.Counter) float64 {
+	var metric dto.Metric
+	require.NoError(t, counter.Write(&metric))
+	return metric.Counter.GetValue()
+}
 
 func TestCheckRangeModeStatementShape(t *testing.T) {
 	cases := []struct {
@@ -389,6 +398,7 @@ func TestNonTransactionalDMLDXFCheckpointSummaryCleanupAndResultFallback(t *test
 
 	metaBytes, err := json.Marshal(taskMeta)
 	require.NoError(t, err)
+	cleanupBefore := readTestPrometheusCounter(t, tidbmetrics.NonTransactionalDMLCheckpointCleanupCounter.WithLabelValues(tidbmetrics.LblOK))
 	require.NoError(t, cleanupNonTransactionalDMLDXFCheckpoints(
 		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
 		se,
@@ -397,6 +407,8 @@ func TestNonTransactionalDMLDXFCheckpointSummaryCleanupAndResultFallback(t *test
 			Meta:     metaBytes,
 		},
 	))
+	cleanupAfter := readTestPrometheusCounter(t, tidbmetrics.NonTransactionalDMLCheckpointCleanupCounter.WithLabelValues(tidbmetrics.LblOK))
+	require.Equal(t, 1, int(cleanupAfter-cleanupBefore+0.001))
 	rows := mustRows(t, se, "select count(*) from mysql.tidb_nontransactional_dml_checkpoint where job_id = ?", taskMeta.JobID)
 	require.Equal(t, int64(0), rows[0].GetInt64(0))
 
@@ -440,6 +452,7 @@ func TestNonTransactionalDMLDXFCleanupPreservesFailedCheckpoints(t *testing.T) {
 
 	metaBytes, err := json.Marshal(taskMeta)
 	require.NoError(t, err)
+	cleanupBefore := readTestPrometheusCounter(t, tidbmetrics.NonTransactionalDMLCheckpointCleanupCounter.WithLabelValues("skipped"))
 	require.NoError(t, cleanupNonTransactionalDMLDXFCheckpoints(
 		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
 		se,
@@ -448,9 +461,22 @@ func TestNonTransactionalDMLDXFCleanupPreservesFailedCheckpoints(t *testing.T) {
 			Meta:     metaBytes,
 		},
 	))
+	cleanupAfter := readTestPrometheusCounter(t, tidbmetrics.NonTransactionalDMLCheckpointCleanupCounter.WithLabelValues("skipped"))
+	require.Equal(t, 1, int(cleanupAfter-cleanupBefore+0.001))
 	rows := mustRows(t, se, "select status, error from mysql.tidb_nontransactional_dml_checkpoint where job_id = ?", taskMeta.JobID)
 	require.Equal(t, "failed", rows[0].GetString(0))
 	require.Contains(t, rows[0].GetString(1), "permanent failure")
+}
+
+func TestNonTransactionalDMLRangeRetryMetric(t *testing.T) {
+	counter := tidbmetrics.NonTransactionalDMLChunkCounter.WithLabelValues("range", "update", "retry")
+	before := readTestPrometheusCounter(t, counter)
+	recordNonTransactionalDMLRangeRetryMetric(&nonTransactionalDMLRangeContext{
+		executionMode: "range",
+		dmlType:       "update",
+	})
+	after := readTestPrometheusCounter(t, counter)
+	require.Equal(t, 1, int(after-before+0.001))
 }
 
 func TestSplitNonTransactionalDMLSignedHandleRange(t *testing.T) {

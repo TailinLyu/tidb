@@ -18,28 +18,33 @@ import "github.com/prometheus/client_golang/prometheus"
 
 // Session metrics.
 var (
-	AutoIDReqDuration                  prometheus.Histogram
-	SessionExecuteParseDuration        *prometheus.HistogramVec
-	SessionExecuteCompileDuration      *prometheus.HistogramVec
-	SessionExecuteRunDuration          *prometheus.HistogramVec
-	SchemaLeaseErrorCounter            *prometheus.CounterVec
-	SessionRetry                       *prometheus.HistogramVec
-	SessionRetryErrorCounter           *prometheus.CounterVec
-	SessionRestrictedSQLCounter        prometheus.Counter
-	StatementPerTransaction            *prometheus.HistogramVec
-	TransactionDuration                *prometheus.HistogramVec
-	StatementDeadlockDetectDuration    prometheus.Histogram
-	StatementPessimisticRetryCount     prometheus.Histogram
-	StatementLockKeysCount             prometheus.Histogram
-	StatementSharedLockKeysCount       prometheus.Histogram
-	ValidateReadTSFromPDCount          prometheus.Counter
-	NonTransactionalDMLCount           *prometheus.CounterVec
-	TxnStatusEnteringCounter           *prometheus.CounterVec
-	TxnDurationHistogram               *prometheus.HistogramVec
-	LazyPessimisticUniqueCheckSetCount prometheus.Counter
-	PessimisticDMLDurationByAttempt    *prometheus.HistogramVec
-	ResourceGroupQueryTotalCounter     *prometheus.CounterVec
-	FairLockingUsageCount              *prometheus.CounterVec
+	AutoIDReqDuration                           prometheus.Histogram
+	SessionExecuteParseDuration                 *prometheus.HistogramVec
+	SessionExecuteCompileDuration               *prometheus.HistogramVec
+	SessionExecuteRunDuration                   *prometheus.HistogramVec
+	SchemaLeaseErrorCounter                     *prometheus.CounterVec
+	SessionRetry                                *prometheus.HistogramVec
+	SessionRetryErrorCounter                    *prometheus.CounterVec
+	SessionRestrictedSQLCounter                 prometheus.Counter
+	StatementPerTransaction                     *prometheus.HistogramVec
+	TransactionDuration                         *prometheus.HistogramVec
+	StatementDeadlockDetectDuration             prometheus.Histogram
+	StatementPessimisticRetryCount              prometheus.Histogram
+	StatementLockKeysCount                      prometheus.Histogram
+	StatementSharedLockKeysCount                prometheus.Histogram
+	ValidateReadTSFromPDCount                   prometheus.Counter
+	NonTransactionalDMLCount                    *prometheus.CounterVec
+	NonTransactionalDMLTaskCounter              *prometheus.CounterVec
+	NonTransactionalDMLChunkCounter             *prometheus.CounterVec
+	NonTransactionalDMLRowsCounter              *prometheus.CounterVec
+	NonTransactionalDMLDuration                 *prometheus.HistogramVec
+	NonTransactionalDMLCheckpointCleanupCounter *prometheus.CounterVec
+	TxnStatusEnteringCounter                    *prometheus.CounterVec
+	TxnDurationHistogram                        *prometheus.HistogramVec
+	LazyPessimisticUniqueCheckSetCount          prometheus.Counter
+	PessimisticDMLDurationByAttempt             *prometheus.HistogramVec
+	ResourceGroupQueryTotalCounter              *prometheus.CounterVec
+	FairLockingUsageCount                       *prometheus.CounterVec
 )
 
 // InitSessionMetrics initializes session metrics.
@@ -186,6 +191,52 @@ func InitSessionMetrics() {
 		}, []string{LblType},
 	)
 
+	NonTransactionalDMLTaskCounter = NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "session",
+			Name:      "non_transactional_dml_tasks_total",
+			Help:      "Counter of non-transactional DML range/DXF task lifecycle events.",
+		}, []string{LblMode, LblType, LblResult},
+	)
+
+	NonTransactionalDMLChunkCounter = NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "session",
+			Name:      "non_transactional_dml_chunks_total",
+			Help:      "Counter of non-transactional DML range/DXF chunk checkpoint states.",
+		}, []string{LblMode, LblType, LblStatus},
+	)
+
+	NonTransactionalDMLRowsCounter = NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "session",
+			Name:      "non_transactional_dml_rows_total",
+			Help:      "Counter of non-transactional DML range/DXF scanned and affected rows.",
+		}, []string{LblMode, LblType, LblKind},
+	)
+
+	NonTransactionalDMLDuration = NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "tidb",
+			Subsystem: "session",
+			Name:      "non_transactional_dml_duration_seconds",
+			Help:      "Bucketed histogram of non-transactional DML range/DXF task duration.",
+			Buckets:   prometheus.ExponentialBuckets(0.1, 2, 24), // 100ms ~ 19 days
+		}, []string{LblMode, LblType, LblResult},
+	)
+
+	NonTransactionalDMLCheckpointCleanupCounter = NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "session",
+			Name:      "non_transactional_dml_checkpoint_cleanup_total",
+			Help:      "Counter of non-transactional DML DXF checkpoint cleanup results.",
+		}, []string{LblResult},
+	)
+
 	TxnStatusEnteringCounter = NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "tidb",
@@ -253,6 +304,9 @@ const (
 	LblResult         = "result"
 	LblSQLType        = "sql_type"
 	LblCoprType       = "copr_type"
+	LblMode           = "mode"
+	LblStatus         = "status"
+	LblKind           = "kind"
 	LblGeneral        = "general"
 	LblInternal       = "internal"
 	LblTxnMode        = "txn_mode"

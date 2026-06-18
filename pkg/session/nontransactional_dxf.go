@@ -22,6 +22,7 @@ import (
 	"math/big"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/disttask/framework/handle"
@@ -39,6 +40,7 @@ import (
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
+	session_metrics "github.com/pingcap/tidb/pkg/session/metrics"
 	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/types"
@@ -58,6 +60,7 @@ type nonTransactionalDMLTaskMeta struct {
 	JobID             string                            `json:"job_id"`
 	ExecutableDML     string                            `json:"executable_dml"`
 	DisplayDML        string                            `json:"display_dml"`
+	DMLType           string                            `json:"dml_type,omitempty"`
 	CurrentDB         string                            `json:"current_db"`
 	DBName            string                            `json:"db_name"`
 	TableName         string                            `json:"table_name"`
@@ -135,7 +138,7 @@ func registerNonTransactionalDMLDXFTask() {
 
 func handleNonTransactionalDMLByDXF(ctx context.Context, stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session,
 	resolveCtx *resolve.Context, tableName *ast.TableName, shardColumnInfo *model.ColumnInfo,
-	tableSources []*ast.TableSource) (sqlexec.RecordSet, error) {
+	tableSources []*ast.TableSource) (recordSet sqlexec.RecordSet, retErr error) {
 	taskMgr, err := storage.GetTaskManager()
 	if err != nil {
 		return handleNonTransactionalDMLByRange(ctx, stmt, se, resolveCtx, tableName, shardColumnInfo, tableSources)
@@ -161,6 +164,8 @@ func handleNonTransactionalDMLByDXF(ctx context.Context, stmt *ast.NonTransactio
 	if err != nil {
 		return nil, err
 	}
+	rangeCtx.executionMode = session_metrics.NonTransactionalDMLModeDXF
+	rangeCtx.dmlType = nonTransactionalDMLStmtType(stmt.DMLStmt)
 	taskMeta, err := buildNonTransactionalDMLTaskMeta(rangeCtx, se, int(stmt.Limit))
 	if err != nil {
 		return nil, err
@@ -180,6 +185,13 @@ func handleNonTransactionalDMLByDXF(ctx context.Context, stmt *ast.NonTransactio
 	if err != nil {
 		return nil, err
 	}
+	session_metrics.NonTransactionalDMLTaskInc(session_metrics.NonTransactionalDMLModeDXF, taskMeta.DMLType, session_metrics.NonTransactionalDMLTaskSubmitted)
+	startTime := time.Now()
+	defer func() {
+		result := metricsResultLabel(retErr)
+		session_metrics.NonTransactionalDMLTaskInc(session_metrics.NonTransactionalDMLModeDXF, taskMeta.DMLType, result)
+		session_metrics.NonTransactionalDMLDurationObserve(session_metrics.NonTransactionalDMLModeDXF, taskMeta.DMLType, result, time.Since(startTime).Seconds())
+	}()
 	logutil.Logger(ctx).Info("Non-transactional DML DXF task submitted",
 		zap.Int64("task-id", task.ID),
 		zap.String("job-id", taskMeta.JobID),
@@ -227,6 +239,7 @@ func buildNonTransactionalDMLTaskMeta(rangeCtx *nonTransactionalDMLRangeContext,
 		JobID:             rangeCtx.jobID,
 		ExecutableDML:     executableDML,
 		DisplayDML:        redact.String(se.GetSessionVars().EnableRedactLog, executableDML),
+		DMLType:           rangeCtx.dmlType,
 		CurrentDB:         rangeCtx.currentDB,
 		DBName:            rangeCtx.dbName,
 		TableName:         rangeCtx.tableName,
@@ -364,7 +377,14 @@ func (*nonTransactionalDMLCleanUp) CleanUp(ctx context.Context, task *proto.Task
 	})
 }
 
-func cleanupNonTransactionalDMLDXFCheckpoints(ctx context.Context, se sessiontypes.Session, task *proto.Task) error {
+func cleanupNonTransactionalDMLDXFCheckpoints(ctx context.Context, se sessiontypes.Session, task *proto.Task) (retErr error) {
+	result := session_metrics.NonTransactionalDMLCleanupSkipped
+	defer func() {
+		if retErr != nil {
+			result = "error"
+		}
+		session_metrics.NonTransactionalDMLCheckpointCleanupInc(result)
+	}()
 	taskMeta, err := unmarshalNonTransactionalDMLTaskMeta(task.Meta)
 	if err != nil {
 		return err
@@ -385,7 +405,11 @@ func cleanupNonTransactionalDMLDXFCheckpoints(ctx context.Context, se sessiontyp
 	if task.State != proto.TaskStateSucceed {
 		return nil
 	}
-	return deleteNonTransactionalDMLRangeCheckpoints(ctx, se, taskMeta.JobID)
+	if err := deleteNonTransactionalDMLRangeCheckpoints(ctx, se, taskMeta.JobID); err != nil {
+		return err
+	}
+	result = "ok"
+	return nil
 }
 
 func (e *nonTransactionalDMLTaskExecutor) IsIdempotent(*proto.Subtask) bool {
@@ -543,6 +567,10 @@ func buildNonTransactionalDMLRangeContextFromTaskMeta(taskMeta *nonTransactional
 	if err != nil {
 		return nil, err
 	}
+	dmlType := taskMeta.DMLType
+	if dmlType == "" {
+		dmlType = nonTransactionalDMLStmtType(stmt.DMLStmt)
+	}
 	return &nonTransactionalDMLRangeContext{
 		stmt:              stmt,
 		tableInfo:         &model.TableInfo{ID: taskMeta.TableID},
@@ -557,6 +585,8 @@ func buildNonTransactionalDMLRangeContextFromTaskMeta(taskMeta *nonTransactional
 		originalCondition: stmt.DMLStmt.WhereExpr(),
 		originalWhereSQL:  taskMeta.OriginalWhereSQL,
 		jobID:             taskMeta.JobID,
+		executionMode:     session_metrics.NonTransactionalDMLModeDXF,
+		dmlType:           dmlType,
 	}, nil
 }
 
