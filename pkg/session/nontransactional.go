@@ -31,12 +31,14 @@ import (
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/parser/format"
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/parser/opcode"
 	"github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
+	"github.com/pingcap/tidb/pkg/privilege"
 	session_metrics "github.com/pingcap/tidb/pkg/session/metrics"
 	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
@@ -808,11 +810,7 @@ func runNonTransactionalDMLRange(ctx context.Context, rangeCtx *nonTransactional
 func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessiontypes.Session, worker sessiontypes.Session, currentDB string) error {
 	parentVars := parent.GetSessionVars()
 	workerVars := worker.GetSessionVars()
-	if parentVars.User != nil {
-		user := *parentVars.User
-		worker.AuthWithoutVerification(&user)
-	}
-	workerVars.ActiveRoles = append(workerVars.ActiveRoles[:0], parentVars.ActiveRoles...)
+	applyNonTransactionalDMLWorkerIdentity(worker, parentVars.User, parentVars.ActiveRoles)
 	applyNonTransactionalDMLWorkerResourceGroup(workerVars, parentVars.ResourceGroupName, parentVars.StmtCtx.ResourceGroupName)
 	if err := applyNonTransactionalDMLWorkerSysVars(workerVars, collectNonTransactionalDMLWorkerSysVars(parentVars)); err != nil {
 		return err
@@ -821,6 +819,43 @@ func prepareNonTransactionalDMLRangeWorker(ctx context.Context, parent sessionty
 		return nil
 	}
 	return executeInternalNoResult(ctx, worker, "USE %n", currentDB)
+}
+
+func cloneNonTransactionalDMLWorkerUser(user *auth.UserIdentity) *auth.UserIdentity {
+	if user == nil {
+		return nil
+	}
+	cloned := *user
+	return &cloned
+}
+
+func cloneNonTransactionalDMLWorkerActiveRoles(activeRoles []*auth.RoleIdentity) []*auth.RoleIdentity {
+	if len(activeRoles) == 0 {
+		return nil
+	}
+	cloned := make([]*auth.RoleIdentity, 0, len(activeRoles))
+	for _, role := range activeRoles {
+		if role == nil {
+			cloned = append(cloned, nil)
+			continue
+		}
+		roleCopy := *role
+		cloned = append(cloned, &roleCopy)
+	}
+	return cloned
+}
+
+func applyNonTransactionalDMLWorkerIdentity(worker sessiontypes.Session, user *auth.UserIdentity, activeRoles []*auth.RoleIdentity) {
+	workerVars := worker.GetSessionVars()
+	if user != nil {
+		if privilege.GetPrivilegeManager(worker) != nil {
+			userCopy := *user
+			worker.AuthWithoutVerification(&userCopy)
+		} else {
+			workerVars.User = cloneNonTransactionalDMLWorkerUser(user)
+		}
+	}
+	workerVars.ActiveRoles = cloneNonTransactionalDMLWorkerActiveRoles(activeRoles)
 }
 
 func applyNonTransactionalDMLWorkerResourceGroup(workerVars *variable.SessionVars, resourceGroupName string, stmtResourceGroupName string) {
@@ -1037,15 +1072,17 @@ func executeNonTransactionalDMLRangeChunk(ctx context.Context, rangeCtx *nonTran
 			err := errors.New(nonTransactionalDMLRangeInjectedErrMsg)
 			_ = executeInternalNoResult(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, "ROLLBACK")
 			result.err = err
-			_ = writeNonTransactionalDMLRangeCheckpoint(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), rangeCtx, se, chunkJob, "failed", 0, err)
 			failpoint.Return(result, true)
 		}
 	})
 	if err := executeSQLNoResult(ctx, se, chunkJob.sql); err != nil {
 		_ = executeInternalNoResult(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), se, "ROLLBACK")
 		result.err = err
-		_ = writeNonTransactionalDMLRangeCheckpoint(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), rangeCtx, se, chunkJob, "failed", 0, err)
-		return result, isNonTransactionalDMLRangeRetryableError(err)
+		retryable := isNonTransactionalDMLRangeRetryableError(err)
+		if !retryable {
+			_ = writeNonTransactionalDMLRangeCheckpoint(kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers), rangeCtx, se, chunkJob, "failed", 0, err)
+		}
+		return result, retryable
 	}
 	affectedRows := se.AffectedRows()
 	result.affected = affectedRows
@@ -1071,6 +1108,14 @@ func executeNonTransactionalDMLRangeChunk(ctx context.Context, rangeCtx *nonTran
 func isNonTransactionalDMLRangeRetryableError(err error) bool {
 	if err == nil {
 		return false
+	}
+	cause := errors.Cause(err)
+	if cause == context.Canceled || cause == context.DeadlineExceeded {
+		return true
+	}
+	errText := err.Error()
+	if strings.Contains(errText, context.Canceled.Error()) || strings.Contains(errText, context.DeadlineExceeded.Error()) {
+		return true
 	}
 	if strings.Contains(err.Error(), nonTransactionalDMLRangeInjectedErrMsg) {
 		return true

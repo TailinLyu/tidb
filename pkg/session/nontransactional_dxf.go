@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/parser/format"
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
@@ -65,6 +66,8 @@ type nonTransactionalDMLTaskMeta struct {
 	OriginalWhereSQL  string                            `json:"original_where_sql"`
 	BatchSize         int                               `json:"batch_size"`
 	SysVars           map[string]string                 `json:"sys_vars,omitempty"`
+	User              *auth.UserIdentity                `json:"user,omitempty"`
+	ActiveRoles       []*auth.RoleIdentity              `json:"active_roles,omitempty"`
 	ResourceGroup     string                            `json:"resource_group,omitempty"`
 	StmtResourceGroup string                            `json:"stmt_resource_group,omitempty"`
 	Ranges            []nonTransactionalDMLSubtaskMeta  `json:"ranges,omitempty"`
@@ -202,6 +205,8 @@ func buildNonTransactionalDMLTaskMeta(rangeCtx *nonTransactionalDMLRangeContext,
 		OriginalWhereSQL:  rangeCtx.originalWhereSQL,
 		BatchSize:         batchSize,
 		SysVars:           collectNonTransactionalDMLWorkerSysVars(se.GetSessionVars()),
+		User:              cloneNonTransactionalDMLWorkerUser(se.GetSessionVars().User),
+		ActiveRoles:       cloneNonTransactionalDMLWorkerActiveRoles(se.GetSessionVars().ActiveRoles),
 		ResourceGroup:     se.GetSessionVars().ResourceGroupName,
 		StmtResourceGroup: se.GetSessionVars().StmtCtx.ResourceGroupName,
 	}, nil
@@ -365,14 +370,8 @@ func (e *nonTransactionalDMLStepExecutor) RealtimeSummary() *execute.SubtaskSumm
 
 func (e *nonTransactionalDMLStepExecutor) runSubtaskWithSession(ctx context.Context, se sessiontypes.Session,
 	subtaskMeta *nonTransactionalDMLSubtaskMeta, scanned *uint64, affected *uint64) error {
-	applyNonTransactionalDMLWorkerResourceGroup(se.GetSessionVars(), e.taskMeta.ResourceGroup, e.taskMeta.StmtResourceGroup)
-	if err := applyNonTransactionalDMLWorkerSysVars(se.GetSessionVars(), e.taskMeta.SysVars); err != nil {
+	if err := prepareNonTransactionalDMLDXFSession(ctx, se, e.taskMeta); err != nil {
 		return err
-	}
-	if e.taskMeta.CurrentDB != "" {
-		if err := executeInternalNoResult(ctx, se, "USE %n", e.taskMeta.CurrentDB); err != nil {
-			return err
-		}
 	}
 	rangeCtx, err := buildNonTransactionalDMLRangeContextFromTaskMeta(e.taskMeta)
 	if err != nil {
@@ -383,7 +382,10 @@ func (e *nonTransactionalDMLStepExecutor) runSubtaskWithSession(ctx context.Cont
 		return err
 	}
 	if checkpoint.status == "failed" {
-		return errors.Errorf("Non-transactional DML DXF range %d has failed checkpoint: %s", subtaskMeta.RangeID, checkpoint.errText)
+		if !isNonTransactionalDMLRangeRetryableError(errors.New(checkpoint.errText)) {
+			return errors.Errorf("Non-transactional DML DXF range %d has failed checkpoint: %s", subtaskMeta.RangeID, checkpoint.errText)
+		}
+		checkpoint = nonTransactionalDMLRangeCheckpoint{}
 	}
 	start := subtaskMeta.RangeStart
 	if checkpoint.status == "done" && checkpoint.checkpoint != nil {
@@ -499,6 +501,13 @@ func planNonTransactionalDMLDXFRanges(ctx context.Context, h storage.TaskHandle,
 	var maxHandle int64
 	var hasRows bool
 	err := h.WithNewSession(func(se sessionctx.Context) error {
+		session, ok := se.(sessiontypes.Session)
+		if !ok {
+			return errors.New("Non-transactional DML DXF planner requires a session executor")
+		}
+		if err := prepareNonTransactionalDMLDXFSession(ctx, session, taskMeta); err != nil {
+			return err
+		}
 		rows, err := sqlexec.ExecSQL(ctx, se.GetSQLExecutor(),
 			fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s WHERE (%s)",
 				taskMeta.HandleExprSQL, taskMeta.HandleExprSQL, taskMeta.FromSQL, taskMeta.OriginalWhereSQL))
@@ -517,6 +526,18 @@ func planNonTransactionalDMLDXFRanges(ctx context.Context, h storage.TaskHandle,
 		return nil, err
 	}
 	return splitNonTransactionalDMLSignedHandleRange(minHandle, maxHandle, concurrency), nil
+}
+
+func prepareNonTransactionalDMLDXFSession(ctx context.Context, se sessiontypes.Session, taskMeta *nonTransactionalDMLTaskMeta) error {
+	applyNonTransactionalDMLWorkerIdentity(se, taskMeta.User, taskMeta.ActiveRoles)
+	applyNonTransactionalDMLWorkerResourceGroup(se.GetSessionVars(), taskMeta.ResourceGroup, taskMeta.StmtResourceGroup)
+	if err := applyNonTransactionalDMLWorkerSysVars(se.GetSessionVars(), taskMeta.SysVars); err != nil {
+		return err
+	}
+	if taskMeta.CurrentDB == "" {
+		return nil
+	}
+	return executeInternalNoResult(ctx, se, "USE %n", taskMeta.CurrentDB)
 }
 
 func splitNonTransactionalDMLSignedHandleRange(minHandle int64, maxHandle int64, count int) []nonTransactionalDMLSubtaskMeta {

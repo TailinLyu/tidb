@@ -16,17 +16,24 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
+	"github.com/pingcap/tidb/pkg/disttask/framework/storage"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
+	"github.com/pingcap/tidb/pkg/privilege"
 	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
+	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
@@ -135,6 +142,33 @@ func TestApplyNonTransactionalDMLWorkerResourceGroup(t *testing.T) {
 	require.Equal(t, "rg_session", vars.StmtCtx.ResourceGroupName)
 }
 
+func TestApplyNonTransactionalDMLWorkerIdentityWithoutPrivilegeManager(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	defer func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	}()
+	workerSe := CreateSessionAndSetID(t, store)
+	privilege.BindPrivilegeManager(workerSe, nil)
+
+	submitterUser := &auth.UserIdentity{Username: "root", Hostname: "127.0.0.1", AuthUsername: "root", AuthHostname: "%"}
+	submitterRoles := []*auth.RoleIdentity{{Username: "ntdml_role", Hostname: "%"}}
+
+	require.NotPanics(t, func() {
+		applyNonTransactionalDMLWorkerIdentity(workerSe, submitterUser, submitterRoles)
+	})
+	require.NotNil(t, workerSe.GetSessionVars().User)
+	require.Equal(t, "root", workerSe.GetSessionVars().User.Username)
+	require.Equal(t, "127.0.0.1", workerSe.GetSessionVars().User.Hostname)
+	require.Len(t, workerSe.GetSessionVars().ActiveRoles, 1)
+	require.Equal(t, "ntdml_role", workerSe.GetSessionVars().ActiveRoles[0].Username)
+
+	submitterUser.Username = "changed"
+	submitterRoles[0].Username = "changed"
+	require.Equal(t, "root", workerSe.GetSessionVars().User.Username)
+	require.Equal(t, "ntdml_role", workerSe.GetSessionVars().ActiveRoles[0].Username)
+}
+
 func TestNonTransactionalDMLDXFRunSubtaskResumesFromCheckpoint(t *testing.T) {
 	store, dom := CreateStoreAndBootstrap(t)
 	defer func() {
@@ -181,6 +215,131 @@ func TestNonTransactionalDMLDXFRunSubtaskResumesFromCheckpoint(t *testing.T) {
 	require.Equal(t, "done", rows[0].GetString(2))
 }
 
+func TestNonTransactionalDMLDXFRunSubtaskIgnoresRetryableFailedCheckpoint(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	defer func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	}()
+	se := CreateSessionAndSetID(t, store)
+
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t(a int primary key clustered, b int)")
+	for i := 1; i <= 3; i++ {
+		MustExec(t, se, "insert into t values (?, ?)", i, i)
+	}
+
+	taskMeta, subtaskMeta := buildTestNonTransactionalDMLTaskMeta(t, se,
+		"batch on a limit 3 update t set b = b + 1 where a <= 3", 3)
+	rangeCtx, err := buildNonTransactionalDMLRangeContextFromTaskMeta(taskMeta)
+	require.NoError(t, err)
+	require.NoError(t, writeNonTransactionalDMLRangeCheckpoint(
+		kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers),
+		rangeCtx,
+		se,
+		nonTransactionalDMLRangeChunk{
+			jobID:   taskMeta.JobID,
+			rangeID: subtaskMeta.RangeID,
+			end:     3,
+			size:    3,
+		},
+		"failed",
+		0,
+		errors.New(nonTransactionalDMLRangeInjectedErrMsg),
+	))
+
+	resumeSe := CreateSessionAndSetID(t, store)
+	var scanned uint64
+	var affected uint64
+	executor := &nonTransactionalDMLStepExecutor{taskMeta: taskMeta}
+	require.NoError(t, executor.runSubtaskWithSession(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
+		resumeSe, subtaskMeta, &scanned, &affected))
+
+	rows := mustRows(t, se, "select a, b from t order by a")
+	require.Equal(t, int64(2), rows[0].GetInt64(1))
+	require.Equal(t, int64(3), rows[1].GetInt64(1))
+	require.Equal(t, int64(4), rows[2].GetInt64(1))
+	rows = mustRows(t, se, "select scanned, affected, status from mysql.tidb_nontransactional_dml_checkpoint where job_id = ? and range_id = ?",
+		taskMeta.JobID, subtaskMeta.RangeID)
+	require.Equal(t, int64(3), rows[0].GetInt64(0))
+	require.Equal(t, int64(3), rows[0].GetInt64(1))
+	require.Equal(t, "done", rows[0].GetString(2))
+}
+
+func TestNonTransactionalDMLDXFPlanningUsesTaskSessionContext(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	defer func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	}()
+	submitterSe := CreateSessionAndSetID(t, store)
+	plannerSe := CreateSessionAndSetID(t, store)
+
+	MustExec(t, submitterSe, "use test")
+	MustExec(t, submitterSe, "set time_zone = '+00:00'")
+	MustExec(t, submitterSe, "create table t(a int primary key clustered, ts timestamp)")
+	MustExec(t, submitterSe, "insert into t values (1, '2020-01-01 00:30:00')")
+	MustExec(t, plannerSe, "set time_zone = '+02:00'")
+
+	taskMeta, _ := buildTestNonTransactionalDMLTaskMeta(t, submitterSe,
+		"batch on a limit 1 update t set a = a where ts >= '2020-01-01 00:00:00' and ts < '2020-01-01 01:00:00'", 1)
+	ranges, err := planNonTransactionalDMLDXFRanges(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
+		testTaskHandle{se: plannerSe},
+		taskMeta,
+		1,
+	)
+	require.NoError(t, err)
+	require.Len(t, ranges, 1)
+	require.Nil(t, ranges[0].RangeStart)
+	require.NotNil(t, ranges[0].RangeEnd)
+	require.Equal(t, int64(1), *ranges[0].RangeEnd)
+}
+
+func TestNonTransactionalDMLDXFTaskMetaAndWorkerPreserveSubmitterIdentity(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	defer func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	}()
+	submitterSe := CreateSessionAndSetID(t, store)
+
+	MustExec(t, submitterSe, "use test")
+	MustExec(t, submitterSe, "create table t(a int primary key clustered, b int)")
+	MustExec(t, submitterSe, "insert into t values (1, 1)")
+	submitterSe.GetSessionVars().User = &auth.UserIdentity{Username: "root", Hostname: "%", AuthUsername: "root", AuthHostname: "%"}
+	submitterSe.GetSessionVars().ActiveRoles = []*auth.RoleIdentity{{Username: "ntdml_role", Hostname: "%"}}
+
+	taskMeta, subtaskMeta := buildTestNonTransactionalDMLTaskMeta(t, submitterSe,
+		"batch on a limit 1 update t set b = b + 1 where a = 1", 1)
+	metaBytes, err := json.Marshal(taskMeta)
+	require.NoError(t, err)
+	var metaJSON map[string]any
+	require.NoError(t, json.Unmarshal(metaBytes, &metaJSON))
+	require.Contains(t, metaJSON, "user")
+	require.Contains(t, metaJSON, "active_roles")
+
+	workerSe := CreateSessionAndSetID(t, store)
+	taskMetaValue := reflect.ValueOf(taskMeta).Elem()
+	require.True(t, taskMetaValue.FieldByName("User").IsValid())
+	require.True(t, taskMetaValue.FieldByName("ActiveRoles").IsValid())
+
+	executor := &nonTransactionalDMLStepExecutor{taskMeta: taskMeta}
+	var scanned uint64
+	var affected uint64
+	require.NoError(t, executor.runSubtaskWithSession(
+		kv.WithInternalSourceType(context.Background(), kv.InternalDistTask),
+		workerSe, subtaskMeta, &scanned, &affected))
+
+	require.NotNil(t, workerSe.GetSessionVars().User)
+	require.Equal(t, "root", workerSe.GetSessionVars().User.Username)
+	require.Equal(t, "%", workerSe.GetSessionVars().User.Hostname)
+	require.Len(t, workerSe.GetSessionVars().ActiveRoles, 1)
+	require.Equal(t, "ntdml_role", workerSe.GetSessionVars().ActiveRoles[0].Username)
+	require.Equal(t, "%", workerSe.GetSessionVars().ActiveRoles[0].Hostname)
+}
+
 func TestSplitNonTransactionalDMLSignedHandleRange(t *testing.T) {
 	ranges := splitNonTransactionalDMLSignedHandleRange(1, 6, 2)
 	require.Len(t, ranges, 2)
@@ -205,6 +364,23 @@ func TestSplitNonTransactionalDMLSignedHandleRange(t *testing.T) {
 	require.Equal(t, int64(math.MinInt64), *ranges[0].RangeEnd)
 	require.Equal(t, int64(math.MinInt64), *ranges[1].RangeStart)
 	require.Equal(t, int64(math.MinInt64+1), *ranges[1].RangeEnd)
+}
+
+type testTaskHandle struct {
+	storage.TaskHandle
+	se sessionctx.Context
+}
+
+func (h testTaskHandle) WithNewSession(fn func(se sessionctx.Context) error) error {
+	return fn(h.se)
+}
+
+func (h testTaskHandle) WithNewTxn(_ context.Context, fn func(se sessionctx.Context) error) error {
+	return fn(h.se)
+}
+
+func (h testTaskHandle) GetPreviousSubtaskMetas(int64, proto.Step) ([][]byte, error) {
+	return nil, nil
 }
 
 func parseNonTransactionalDML(t *testing.T, sql string) *ast.NonTransactionalDMLStmt {
