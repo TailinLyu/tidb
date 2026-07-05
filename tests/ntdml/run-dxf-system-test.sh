@@ -24,6 +24,8 @@ PD_IMAGE="${PD_IMAGE:-pingcap/pd:v8.5.0}"
 TIKV_IMAGE="${TIKV_IMAGE:-pingcap/tikv:v8.5.0}"
 MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.0}"
 CURL_IMAGE="${CURL_IMAGE:-curlimages/curl:8.8.0}"
+PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-prom/prometheus:v2.53.0}"
+GRAFANA_IMAGE="${GRAFANA_IMAGE:-grafana/grafana:10.4.5}"
 
 # Default data sizes are kept laptop-friendly. For a larger/GB-class run, set
 # NTDML_LARGE_MODE=1 or override these directly, for example:
@@ -90,6 +92,47 @@ else
 	echo "Using TIDB_IMAGE=$TIDB_IMAGE. Set BUILD_TIDB=1 to build this branch before running." >&2
 fi
 
+mkdir -p "$WORK_DIR/grafana/provisioning/datasources" "$WORK_DIR/grafana/provisioning/dashboards"
+
+cat > "$WORK_DIR/prometheus.yml" <<'YAML'
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+scrape_configs:
+  - job_name: tidb
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - tidb0:10080
+          - tidb1:10080
+YAML
+
+cat > "$WORK_DIR/grafana/provisioning/datasources/prometheus.yml" <<'YAML'
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+YAML
+
+cat > "$WORK_DIR/grafana/provisioning/dashboards/tidb.yml" <<'YAML'
+apiVersion: 1
+providers:
+  - name: tidb-ntdml
+    orgId: 1
+    folder: TiDB
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 5
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+YAML
+
 cat > "$WORK_DIR/docker-compose.yml" <<YAML
 services:
   pd:
@@ -145,6 +188,30 @@ services:
       - --log-file=/tmp/tidb1.log
     depends_on:
       - tikv
+  prometheus:
+    image: ${PROMETHEUS_IMAGE}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1h
+    volumes:
+      - "${WORK_DIR}/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+    depends_on:
+      - tidb0
+      - tidb1
+  grafana:
+    image: ${GRAFANA_IMAGE}
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - "${WORK_DIR}/grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "${ROOT_DIR}/pkg/metrics/grafana/non_transactional_dml.json:/var/lib/grafana/dashboards/non_transactional_dml.json:ro"
+    depends_on:
+      - prometheus
 YAML
 
 "${COMPOSE[@]}" -p "$PROJECT" -f "$WORK_DIR/docker-compose.yml" up -d
@@ -175,6 +242,10 @@ scalar() {
 	scalar_on tidb0 "$1"
 }
 
+http_get() {
+	docker run --rm --network "$NETWORK" "$CURL_IMAGE" -fsS "$@"
+}
+
 wait_sql() {
 	host="$1"
 	for _ in $(seq 1 90); do
@@ -189,12 +260,111 @@ wait_sql() {
 wait_status() {
 	host="$1"
 	for _ in $(seq 1 60); do
-		if docker run --rm --network "$NETWORK" "$CURL_IMAGE" -fsS "http://${host}:10080/status" >/dev/null 2>&1; then
+		if http_get "http://${host}:10080/status" >/dev/null 2>&1; then
 			return
 		fi
 		sleep 2
 	done
-	docker run --rm --network "$NETWORK" "$CURL_IMAGE" -fsS "http://${host}:10080/status" >/dev/null
+	http_get "http://${host}:10080/status" >/dev/null
+}
+
+wait_http() {
+	url="$1"
+	label="$2"
+	for _ in $(seq 1 90); do
+		if http_get "$url" >/dev/null 2>&1; then
+			return
+		fi
+		sleep 2
+	done
+	echo "timed out waiting for ${label}: ${url}" >&2
+	http_get "$url" >/dev/null
+}
+
+query_metrics() {
+	source="$1"
+	query="$2"
+	case "$source" in
+		prometheus)
+			http_get --get --data-urlencode "query=$query" "http://prometheus:9090/api/v1/query"
+			;;
+		grafana)
+			http_get -u admin:admin --get --data-urlencode "query=$query" \
+				"http://grafana:3000/api/datasources/proxy/uid/prometheus/api/v1/query"
+			;;
+		*)
+			echo "unknown metrics query source: $source" >&2
+			exit 1
+			;;
+	esac
+}
+
+wait_metrics_query_nonempty() {
+	source="$1"
+	query="$2"
+	label="$3"
+	response=""
+	for _ in $(seq 1 120); do
+		response="$(query_metrics "$source" "$query" 2>/dev/null || true)"
+		if printf "%s" "$response" | grep -q '"status":"success"' &&
+			printf "%s" "$response" | grep -q '"result":\[{' ; then
+			return
+		fi
+		sleep 2
+	done
+	echo "timed out waiting for ${source} query result: ${label}" >&2
+	echo "query: ${query}" >&2
+	echo "last response: ${response:-<empty>}" >&2
+	exit 1
+}
+
+wait_grafana_provisioning() {
+	wait_http "http://grafana:3000/api/health" "Grafana health"
+
+	response=""
+	for _ in $(seq 1 90); do
+		response="$(http_get -u admin:admin "http://grafana:3000/api/datasources/uid/prometheus" 2>/dev/null || true)"
+		if printf "%s" "$response" | grep -q '"type":"prometheus"'; then
+			break
+		fi
+		sleep 2
+	done
+	if ! printf "%s" "$response" | grep -q '"type":"prometheus"'; then
+		echo "timed out waiting for Grafana Prometheus datasource" >&2
+		echo "last response: ${response:-<empty>}" >&2
+		exit 1
+	fi
+
+	response=""
+	for _ in $(seq 1 90); do
+		response="$(http_get -u admin:admin "http://grafana:3000/api/dashboards/uid/tidb-non-transactional-dml" 2>/dev/null || true)"
+		if printf "%s" "$response" | grep -q '"title":"Test-Cluster-TiDB-Non-Transactional-DML"'; then
+			return
+		fi
+		sleep 2
+	done
+	echo "timed out waiting for Grafana NTDML dashboard provisioning" >&2
+	echo "last response: ${response:-<empty>}" >&2
+	exit 1
+}
+
+wait_ntdml_metrics_captured() {
+	source="$1"
+	wait_metrics_query_nonempty "$source" \
+		'sum(increase(tidb_session_non_transactional_dml_count[10m])) > 0' \
+		"non-transactional DML statement count"
+	wait_metrics_query_nonempty "$source" \
+		'sum(increase(tidb_session_non_transactional_dml_task_total[10m])) > 0' \
+		"non-transactional DML task counter"
+	wait_metrics_query_nonempty "$source" \
+		'sum(increase(tidb_session_non_transactional_dml_chunk_total[10m])) > 0' \
+		"non-transactional DML chunk counter"
+	wait_metrics_query_nonempty "$source" \
+		'sum(increase(tidb_session_non_transactional_dml_rows_total[10m])) > 0' \
+		"non-transactional DML rows counter"
+	wait_metrics_query_nonempty "$source" \
+		'sum(increase(tidb_session_non_transactional_dml_duration_seconds_count[10m])) > 0' \
+		"non-transactional DML duration histogram"
 }
 
 wait_scalar_equals() {
@@ -236,6 +406,10 @@ wait_checkpoint_cleanup() {
 
 wait_sql tidb0
 wait_sql tidb1
+wait_http "http://prometheus:9090/-/ready" "Prometheus readiness"
+wait_grafana_provisioning
+wait_metrics_query_nonempty prometheus 'count(up{job="tidb"} == 1) == 2' "Prometheus TiDB scrape targets"
+wait_metrics_query_nonempty grafana 'count(up{job="tidb"} == 1) == 2' "Grafana Prometheus datasource query"
 
 {
 	cat <<'SQL'
@@ -366,8 +540,10 @@ wait_positive_scalar tidb1 \
 	"SELECT COUNT(*) FROM mysql.tidb_nontransactional_dml_checkpoint WHERE db_name='ntdml_system' AND status='done'" \
 	"in-flight checkpoint progress" >/dev/null
 
-docker run --rm --network "$NETWORK" "$CURL_IMAGE" -fsS http://tidb0:10080/metrics \
+http_get http://tidb0:10080/metrics \
 	| grep -E 'tidb_session_non_transactional_dml_(task|chunk|rows)_total' >/dev/null
+wait_ntdml_metrics_captured prometheus
+wait_ntdml_metrics_captured grafana
 
 docker restart "$(tidb_container tidb1)" >/dev/null
 wait_status tidb1
@@ -423,7 +599,11 @@ if [[ "$failed_checkpoints" == "0" ]]; then
 fi
 sql -e "DELETE FROM mysql.tidb_nontransactional_dml_checkpoint WHERE status='failed'" >/dev/null
 
-docker run --rm --network "$NETWORK" "$CURL_IMAGE" -fsS http://tidb0:10080/metrics \
+http_get http://tidb0:10080/metrics \
 	| grep -E 'tidb_session_non_transactional_dml_(task|chunk|rows)_total' >/dev/null
+wait_metrics_query_nonempty prometheus 'count(up{job="tidb"} == 1) == 2' "Prometheus TiDB scrape targets after restart"
+wait_metrics_query_nonempty grafana 'count(up{job="tidb"} == 1) == 2' "Grafana Prometheus datasource query after restart"
+wait_ntdml_metrics_captured prometheus
+wait_ntdml_metrics_captured grafana
 
 echo "parallel non-transactional DML DXF system test passed"
