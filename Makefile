@@ -84,6 +84,7 @@ lint:tools/bin/revive
 	go run tools/dashboard-linter/main.go pkg/metrics/grafana/tidb_resource_control.json
 	go run tools/dashboard-linter/main.go pkg/metrics/grafana/tidb_runtime.json
 	go run tools/dashboard-linter/main.go pkg/metrics/grafana/tidb_summary.json
+	go run tools/dashboard-linter/main.go pkg/metrics/grafana/non_transactional_dml.json
 
 .PHONY: license
 license:
