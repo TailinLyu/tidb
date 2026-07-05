@@ -404,6 +404,16 @@ wait_checkpoint_cleanup() {
 	wait_scalar_equals "$host" "SELECT COUNT(*) FROM mysql.tidb_nontransactional_dml_checkpoint" "0" "checkpoint cleanup"
 }
 
+ensure_failover_running() {
+	label="$1"
+	if ! kill -0 "$failover_pid" 2>/dev/null; then
+		echo "failover workload finished before ${label}" >&2
+		cat "$WORK_DIR/failover.out" >&2 || true
+		cat "$WORK_DIR/failover.err" >&2 || true
+		exit 1
+	fi
+}
+
 wait_sql tidb0
 wait_sql tidb1
 wait_http "http://prometheus:9090/-/ready" "Prometheus readiness"
@@ -540,21 +550,18 @@ wait_positive_scalar tidb1 \
 	"SELECT COUNT(*) FROM mysql.tidb_nontransactional_dml_checkpoint WHERE db_name='ntdml_system' AND status='done'" \
 	"in-flight checkpoint progress" >/dev/null
 
+ensure_failover_running "Prometheus/Grafana metrics verification started"
 http_get http://tidb0:10080/metrics \
 	| grep -E 'tidb_session_non_transactional_dml_(task|chunk|rows)_total' >/dev/null
 wait_ntdml_metrics_captured prometheus
 wait_ntdml_metrics_captured grafana
+ensure_failover_running "Prometheus/Grafana metrics verification completed"
 
 docker restart "$(tidb_container tidb1)" >/dev/null
 wait_status tidb1
 wait_sql tidb1
 
-if ! kill -0 "$failover_pid" 2>/dev/null; then
-	echo "failover workload finished before restart coverage completed" >&2
-	cat "$WORK_DIR/failover.out" >&2 || true
-	cat "$WORK_DIR/failover.err" >&2 || true
-	exit 1
-fi
+ensure_failover_running "restart coverage completed"
 
 docker kill "$(tidb_container tidb0)" >/dev/null
 wait "$failover_pid" >/dev/null 2>&1 || true
