@@ -696,6 +696,46 @@ func TestNonTransactionalDMLCheckpointWriteReadSummaryAndCleanup(t *testing.T) {
 	require.Equal(t, "write conflict", loaded.ErrorText)
 }
 
+func TestNonTransactionalDMLDXFResultsDeleteSuccessfulCheckpoints(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_dxf_result_cleanup(id bigint primary key clustered, v int)")
+	rangeCtx := buildNonTransactionalDMLRangeContextForTest(t, se,
+		"batch on id limit 2 update t_dxf_result_cleanup set v = 2 where id >= 1",
+		"job-dxf-result-cleanup")
+
+	done := nonTransactionalDMLCheckpoint{
+		JobID:           rangeCtx.JobID,
+		RangeID:         1,
+		Mode:            "dxf",
+		DMLType:         "update",
+		DBName:          "test",
+		TableID:         rangeCtx.TableID,
+		PhysicalTableID: rangeCtx.PhysicalTableID,
+		HandleKind:      rangeCtx.Descriptor.kind,
+		Status:          nonTransactionalDMLCheckpointDone,
+		Scanned:         2,
+		Affected:        2,
+	}
+	require.NoError(t, writeNonTransactionalDMLCheckpoint(context.Background(), se, done))
+
+	rs, err := buildNonTransactionalDMLDXFResults(context.Background(), se, &nonTransactionalDMLDXFTaskMeta{
+		JobID:  rangeCtx.JobID,
+		Ranges: []nonTransactionalDMLDXFRangeMeta{{RangeID: 1}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, rs.Close())
+
+	loaded, err := loadNonTransactionalDMLCheckpoint(context.Background(), se, rangeCtx.JobID, 1, rangeCtx.Descriptor)
+	require.NoError(t, err)
+	require.Nil(t, loaded)
+}
+
 func TestNonTransactionalDMLRetryableErrorClassification(t *testing.T) {
 	require.False(t, isNonTransactionalDMLRetryableError(nil))
 	require.True(t, isNonTransactionalDMLRetryableError(kv.ErrTxnRetryable))

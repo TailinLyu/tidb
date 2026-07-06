@@ -84,6 +84,13 @@ func TestNonTransactionalDMLRangeModeIntAndVarchar(t *testing.T) {
 	tk.MustQuery("select group_concat(id order by id) from t_range_int").Check(testkit.Rows("4,5,6,7"))
 	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
 
+	tk.MustExec("create table t_range_nonidempotent(id bigint primary key clustered, c int)")
+	tk.MustExec("insert into t_range_nonidempotent values (1, 10), (2, 10), (3, 10), (4, 10)")
+	tk.MustQuery("batch on id limit 2 update t_range_nonidempotent set c = c + 1 where id >= 1").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select sum(c) from t_range_nonidempotent").Check(testkit.Rows("44"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
+
 	tk.MustExec("create table t_range_varchar(id varchar(32) collate utf8mb4_bin primary key clustered, v int)")
 	for i := 0; i < 10; i++ {
 		tk.MustExec(fmt.Sprintf("insert into t_range_varchar values ('k%02d', %d)", i, i))

@@ -211,6 +211,123 @@ varbinary,dxf,4,400,80,128,5031,400
 
 The smoke validates row counts and successful checkpoint cleanup after every case. On this small local dataset, range mode is similar to serial because setup and chunk overhead dominate; DXF is slower because distributed task framework scheduling dominates. The script defaults to concurrency `1 2 4 8 16` for larger local or CI sweeps.
 
+## Production Readiness Pass
+
+Added the operator runbook:
+
+- `docs/superpowers/runbooks/2026-07-05-parallel-ntdml-production-runbook.md`
+
+The runbook covers mode selection, initial concurrency, safe `DELETE`, idempotent
+`UPDATE`, non-idempotent update warnings, preflight checklist, checkpoint
+inspection, failed checkpoint cleanup, Prometheus queries, Grafana dashboard
+usage, TiDB submitter/owner/executor restart procedures, unsupported shapes,
+and serial-mode rollback controls.
+
+Grafana dashboard publication was audited:
+
+- `pkg/metrics/grafana/non_transactional_dml.json` is a tracked dashboard added by this PR.
+- `Makefile` runs the dashboard linter for `non_transactional_dml.json` with the other published TiDB dashboards.
+- `tests/ntdml/run-dxf-system-test.sh` provisions the dashboard into Grafana as `Test-Cluster-TiDB-Non-Transactional-DML`.
+- The dashboard contains panels for every dedicated NTDML metric family: `tidb_session_non_transactional_dml_count`, `tidb_session_non_transactional_dml_task_total`, `tidb_session_non_transactional_dml_chunk_total`, `tidb_session_non_transactional_dml_rows_total`, `tidb_session_non_transactional_dml_retry_total`, and `tidb_session_non_transactional_dml_duration_seconds`.
+
+Non-idempotent update acceptance regression:
+
+```bash
+go test -tags intest ./pkg/session/nontransactionaltest -run '^TestNonTransactionalDMLRangeModeIntAndVarchar$' -count=1
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 3.219s`.
+
+This test now includes `BATCH ON id LIMIT 2 UPDATE t_range_nonidempotent SET c = c + 1 WHERE id >= 1` in explicit `range` mode. It confirms the accepted statement shape remains allowed without claiming exactly-once behavior across failures.
+
+Failed checkpoint retention coverage already exists in the focused session suite and was not duplicated:
+
+- `TestNonTransactionalDMLCanceledChunkPreservesFailedCheckpoint` verifies a canceled chunk leaves a failed checkpoint with `error_class = 'canceled'`.
+- `TestNonTransactionalDMLDXFCleanupPreservesFailedTaskCheckpoints` verifies DXF cleanup for a failed task does not delete the retained failed checkpoint.
+- `TestNonTransactionalDMLDXFReplayFailedCheckpoints` verifies retryable failed checkpoints can be replayed, while permanent execution failures remain retained with `error_class` and `error_text`.
+- `TestNonTransactionalDMLCheckpointReadWriteSummaryAndCleanup` verifies checkpoint read/write summary metadata and explicit cleanup helper behavior.
+
+During focused integration verification, the unanchored focused `intest` slice
+initially exposed a successful DXF checkpoint row that could remain after the
+SQL submitter had already observed task success. The retained row had
+`status = 'done'`, so the root cause was successful-job cleanup timing, not
+failed-checkpoint retention. Added a submitter-side cleanup after
+`buildNonTransactionalDMLDXFResults` captures the checkpoint summary; the
+existing asynchronous DXF cleanup still covers detached or recovered jobs.
+
+The new regression failed before the fix and passed after it:
+
+```bash
+go test ./pkg/session -run '^TestNonTransactionalDMLDXFResultsDeleteSuccessfulCheckpoints$' -count=1
+```
+
+Result after fix: passed, `ok github.com/pingcap/tidb/pkg/session 3.704s`.
+
+Updated broader session focused suite including the DXF result cleanup
+regression:
+
+```bash
+go test ./pkg/session -run 'TestNonTransactionalDML(HandleDescriptor|Boundary|RangeCondition|RangeSelectWhere|RangeWorker|RegionRangePlanning|DXFTaskMeta|DXFWait|DXFModeRequiresTaskManager|SessionContext|Checkpoint|DXFResults|Retry|SessionLocal|AmbiguousCommit|DXFReplay|CanceledChunk|DXFCleanup)' -count=1
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session 22.610s`.
+
+Focused integration suite after the cleanup fix:
+
+```bash
+go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransactionalDML(RangeModeIntAndVarchar|DXFModeIntAndVarchar|RangeModeRejectsSessionLocalExpressions|DXFModeRejectsSessionLocalExpressions)' -count=1
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 6.176s`.
+
+Timing-sensitive repeat:
+
+```bash
+go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransactionalDML(RangeModeIntAndVarchar|DXFModeIntAndVarchar|RangeModeRejectsSessionLocalExpressions|DXFModeRejectsSessionLocalExpressions)' -count=2
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 9.590s`.
+
+Sysvar focused suite:
+
+```bash
+go test ./pkg/sessionctx/variable -run 'TestNonTransactionalDML(ExecutionMode|Concurrency)SysVar' -count=1
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/sessionctx/variable 2.991s`.
+
+Static, dashboard, and dashboard coverage checks:
+
+```bash
+bash -n tests/ntdml/run-dxf-system-test.sh
+bash -n tests/ntdml/run-performance-smoke.sh
+python3 -m json.tool pkg/metrics/grafana/non_transactional_dml.json >/dev/null
+go run tools/dashboard-linter/main.go pkg/metrics/grafana/non_transactional_dml.json
+python3 - <<'PY'
+import json, pathlib
+path = pathlib.Path('pkg/metrics/grafana/non_transactional_dml.json')
+data = json.loads(path.read_text())
+exprs = '\n'.join(t.get('expr','') for p in data['panels'] for t in p.get('targets', []))
+metrics = [
+    'tidb_session_non_transactional_dml_count',
+    'tidb_session_non_transactional_dml_task_total',
+    'tidb_session_non_transactional_dml_chunk_total',
+    'tidb_session_non_transactional_dml_rows_total',
+    'tidb_session_non_transactional_dml_retry_total',
+    'tidb_session_non_transactional_dml_duration_seconds_bucket',
+    'tidb_session_non_transactional_dml_duration_seconds_sum',
+    'tidb_session_non_transactional_dml_duration_seconds_count',
+]
+missing = [m for m in metrics if m not in exprs]
+if missing:
+    raise SystemExit('missing dashboard metrics: ' + ', '.join(missing))
+print('dashboard metric coverage ok')
+PY
+git diff --check HEAD
+```
+
+Result: passed with `dashboard metric coverage ok`.
+
 ## Baseline Failure
 
 The full `pkg/session/nontransactionaltest` NTDML regex still fails because an existing failpoint-based serial error-message test does not inject its expected error under the current local test invocation:

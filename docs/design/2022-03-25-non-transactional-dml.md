@@ -164,6 +164,8 @@ resume operations use the same task key when invoked by internal operators.
 Prometheus metrics expose bounded labels for statement adoption, task lifecycle,
 chunk results, scanned and affected rows, retries, and duration histograms. The
 published Grafana dashboard is `pkg/metrics/grafana/non_transactional_dml.json`.
+For production operation details, use
+`docs/superpowers/runbooks/2026-07-05-parallel-ntdml-production-runbook.md`.
 
 Useful operator queries:
 

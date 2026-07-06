@@ -288,7 +288,14 @@ func buildNonTransactionalDMLDXFResults(ctx context.Context, se sessiontypes.Ses
 	for i := 1; i <= jobCount; i++ {
 		jobs = append(jobs, job{jobID: i})
 	}
-	return buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+	result, err := buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+	if err != nil {
+		return nil, err
+	}
+	if err := deleteNonTransactionalDMLCheckpoints(ctx, se, taskMeta.JobID); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func nonTransactionalDMLDXFTaskKey(jobID string) string {
