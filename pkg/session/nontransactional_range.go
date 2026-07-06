@@ -17,6 +17,7 @@ package session
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"math"
 	"sort"
@@ -46,8 +47,9 @@ import (
 )
 
 const (
-	nonTransactionalDMLRangeMaxRetries   = 3
-	nonTransactionalDMLRangeRetryBackoff = 50 * time.Millisecond
+	nonTransactionalDMLRangeMaxRetries        = 3
+	nonTransactionalDMLRangeRetryBackoff      = 50 * time.Millisecond
+	nonTransactionalDMLCheckpointWriteTimeout = 30 * time.Second
 )
 
 type nonTransactionalDMLRangeContext struct {
@@ -620,10 +622,9 @@ func executeNonTransactionalDMLRangeChunkWithRetry(ctx context.Context, se sessi
 		if !isNonTransactionalDMLRetryableError(err) || attempt == nonTransactionalDMLRangeMaxRetries {
 			break
 		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(nonTransactionalDMLRangeRetryBackoff):
+		if err := waitNonTransactionalDMLRangeRetryBackoff(ctx); err != nil {
+			lastErr = err
+			break
 		}
 	}
 	failed := nonTransactionalDMLCheckpoint{
@@ -645,7 +646,9 @@ func executeNonTransactionalDMLRangeChunkWithRetry(ctx context.Context, se sessi
 		Scanned:         scannedBefore + uint64(scanned.size),
 		Affected:        affectedBefore,
 	}
-	if err := writeNonTransactionalDMLCheckpoint(ctx, se, failed); err != nil {
+	checkpointCtx, cancel := nonTransactionalDMLFailedCheckpointWriteContext(ctx)
+	defer cancel()
+	if err := writeNonTransactionalDMLCheckpoint(checkpointCtx, se, failed); err != nil {
 		logutil.Logger(ctx).Warn("failed to write non-transactional DML failed checkpoint", zap.Error(err))
 	}
 	recordNonTransactionalDMLChunkMetrics(rangeCtx, session_metrics.NonTransactionalDMLResultError, attempts-1, uint64(scanned.size), 0)
@@ -674,11 +677,32 @@ func nonTransactionalDMLMetricsResult(err error) string {
 	return session_metrics.NonTransactionalDMLResultOK
 }
 
+func waitNonTransactionalDMLRangeRetryBackoff(ctx context.Context) error {
+	timer := time.NewTimer(nonTransactionalDMLRangeRetryBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func nonTransactionalDMLCheckpointErrorClass(err error) string {
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+		return "canceled"
+	}
 	if isNonTransactionalDMLRetryableError(err) {
 		return "retryable"
 	}
 	return "execution"
+}
+
+func nonTransactionalDMLFailedCheckpointWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), nonTransactionalDMLCheckpointWriteTimeout)
 }
 
 func executeNonTransactionalDMLRangeChunk(ctx context.Context, se sessiontypes.Session, rangeCtx *nonTransactionalDMLRangeContext,

@@ -144,10 +144,11 @@ pre-scan and avoids synthetic midpoint generation for strings.
 
 Progress is durable in `mysql.tidb_nontransactional_dml_checkpoint`. Successful
 jobs delete their checkpoint rows after producing the final summary. Failed or
-canceled jobs retain checkpoint rows with bounded diagnostics. DXF task metadata
-uses task keys of the form `ntdml/<job-id>` and stores redacted display SQL for
-logs; metric labels never include raw SQL, predicates, literals, users, or
-range values.
+canceled jobs retain checkpoint rows with bounded diagnostics. Failed
+checkpoint `error_class` values distinguish retryable, execution, and canceled
+outcomes. DXF task metadata uses task keys of the form `ntdml/<job-id>` and
+stores redacted display SQL for logs; metric labels never include raw SQL,
+predicates, literals, users, or range values.
 
 Parallel non-transactional DML does not provide global atomicity across chunks.
 `DELETE` and idempotent `UPDATE` statements are safe first-class use cases.

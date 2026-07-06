@@ -23,6 +23,7 @@ import (
 
 	"github.com/ngaut/pools"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/disttask/framework/storage"
@@ -39,6 +40,7 @@ import (
 	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/codec"
+	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"github.com/stretchr/testify/require"
 	tikverr "github.com/tikv/client-go/v2/error"
 )
@@ -677,6 +679,180 @@ func TestNonTransactionalDMLRetryableErrorClassification(t *testing.T) {
 	require.False(t, isNonTransactionalDMLRetryableError(&tikverr.ErrDeadlock{Deadlock: &kvrpcpb.Deadlock{}, IsRetryable: false}))
 }
 
+func TestNonTransactionalDMLAmbiguousCommitCoveredByCheckpoint(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_ambiguous(id bigint primary key clustered, v int)")
+	MustExec(t, se, "insert into t_ambiguous values (1, 10), (2, 20)")
+
+	rangeCtx := buildNonTransactionalDMLRangeContextForTest(t, se,
+		"batch on id limit 2 update t_ambiguous set v = v + 1 where id >= 1",
+		"job-ambiguous-commit")
+	scanned, err := scanNonTransactionalDMLRangeChunk(context.Background(), se, rangeCtx, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, scanned)
+	dmlSQL, err := buildNonTransactionalDMLRangeMutationSQL(rangeCtx, nil, &scanned.last)
+	require.NoError(t, err)
+
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/store/mockstore/unistore/rpcCommitTimeout", "return(true)"))
+	affected, err := executeNonTransactionalDMLRangeChunk(context.Background(), se, rangeCtx, 1, nil, scanned, dmlSQL, 0, 0, 0)
+	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/store/mockstore/unistore/rpcCommitTimeout"))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), affected)
+	require.Equal(t, int64(2), requireScalarInt(t, se, "select count(*) from t_ambiguous where (id = 1 and v = 11) or (id = 2 and v = 21)"))
+
+	checkpoint, err := loadNonTransactionalDMLCheckpoint(context.Background(), se, rangeCtx.JobID, 1, rangeCtx.Descriptor)
+	require.NoError(t, err)
+	require.NotNil(t, checkpoint)
+	require.Equal(t, nonTransactionalDMLCheckpointDone, checkpoint.Status)
+	require.Equal(t, int64(2), checkpoint.Checkpoint.value.GetInt64())
+}
+
+func TestNonTransactionalDMLDXFReplayFailedCheckpoints(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_dxf_replay(id bigint primary key clustered, v int not null)")
+	MustExec(t, se, "insert into t_dxf_replay values (1, 1), (2, 2), (3, 3)")
+
+	rangeCtx := buildNonTransactionalDMLRangeContextForTest(t, se,
+		"batch on id limit 2 update t_dxf_replay set v = 9 where id >= 1",
+		"job-dxf-replay")
+	rangeCtx.Mode = "dxf"
+	taskMeta, err := buildNonTransactionalDMLDXFTaskMeta(rangeCtx, []nonTransactionalDMLRangeSpan{{}})
+	require.NoError(t, err)
+	executor := &nonTransactionalDMLStepExecutor{taskMeta: taskMeta}
+
+	failed := nonTransactionalDMLCheckpoint{
+		JobID:           taskMeta.JobID,
+		RangeID:         1,
+		Mode:            "dxf",
+		DMLType:         "update",
+		DBName:          "test",
+		TableID:         rangeCtx.TableID,
+		PhysicalTableID: rangeCtx.PhysicalTableID,
+		HandleKind:      rangeCtx.Descriptor.kind,
+		Status:          nonTransactionalDMLCheckpointFailed,
+		RetryCount:      1,
+		ErrorClass:      "retryable",
+		ErrorText:       "write conflict",
+	}
+	require.NoError(t, writeNonTransactionalDMLCheckpoint(context.Background(), se, failed))
+
+	rangeMeta := &nonTransactionalDMLDXFRangeMeta{RangeID: 1}
+	require.NoError(t, executor.runSubtaskWithSession(context.Background(), se, rangeMeta))
+	require.Equal(t, uint64(3), rangeMeta.Scanned)
+	require.Equal(t, uint64(3), rangeMeta.Affected)
+	require.Equal(t, int64(3), requireScalarInt(t, se, "select count(*) from t_dxf_replay where v = 9"))
+	checkpoint, err := loadNonTransactionalDMLCheckpoint(context.Background(), se, taskMeta.JobID, 1, rangeCtx.Descriptor)
+	require.NoError(t, err)
+	require.NotNil(t, checkpoint)
+	require.Equal(t, nonTransactionalDMLCheckpointDone, checkpoint.Status)
+	require.Empty(t, checkpoint.ErrorText)
+
+	MustExec(t, se, "update t_dxf_replay set v = id")
+	failed.ErrorClass = "execution"
+	failed.ErrorText = "duplicate key"
+	require.NoError(t, writeNonTransactionalDMLCheckpoint(context.Background(), se, failed))
+	err = executor.runSubtaskWithSession(context.Background(), se, &nonTransactionalDMLDXFRangeMeta{RangeID: 1})
+	require.ErrorContains(t, err, "failed checkpoint: duplicate key")
+	require.Equal(t, int64(0), requireScalarInt(t, se, "select count(*) from t_dxf_replay where v = 9"))
+	checkpoint, err = loadNonTransactionalDMLCheckpoint(context.Background(), se, taskMeta.JobID, 1, rangeCtx.Descriptor)
+	require.NoError(t, err)
+	require.NotNil(t, checkpoint)
+	require.Equal(t, nonTransactionalDMLCheckpointFailed, checkpoint.Status)
+	require.Equal(t, "execution", checkpoint.ErrorClass)
+	require.Equal(t, "duplicate key", checkpoint.ErrorText)
+}
+
+func TestNonTransactionalDMLCanceledChunkPreservesFailedCheckpoint(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_cancel_checkpoint(id bigint primary key clustered, v int)")
+	MustExec(t, se, "insert into t_cancel_checkpoint values (1, 1), (2, 2)")
+
+	rangeCtx := buildNonTransactionalDMLRangeContextForTest(t, se,
+		"batch on id limit 2 update t_cancel_checkpoint set v = 8 where id >= 1",
+		"job-cancel-checkpoint")
+	scanned, err := scanNonTransactionalDMLRangeChunk(context.Background(), se, rangeCtx, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, scanned)
+	dmlSQL, err := buildNonTransactionalDMLRangeMutationSQL(rangeCtx, nil, &scanned.last)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = executeNonTransactionalDMLRangeChunkWithRetry(ctx, se, rangeCtx, 1, nil, scanned, dmlSQL, 0, 0)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, int64(0), requireScalarInt(t, se, "select count(*) from t_cancel_checkpoint where v = 8"))
+	checkpoint, err := loadNonTransactionalDMLCheckpoint(context.Background(), se, rangeCtx.JobID, 1, rangeCtx.Descriptor)
+	require.NoError(t, err)
+	require.NotNil(t, checkpoint)
+	require.Equal(t, nonTransactionalDMLCheckpointFailed, checkpoint.Status)
+	require.Equal(t, "canceled", checkpoint.ErrorClass)
+	require.Contains(t, checkpoint.ErrorText, "context canceled")
+}
+
+func TestNonTransactionalDMLDXFCleanupPreservesFailedTaskCheckpoints(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_cleanup_checkpoint(id bigint primary key clustered, v int)")
+	rangeCtx := buildNonTransactionalDMLRangeContextForTest(t, se,
+		"batch on id limit 2 update t_cleanup_checkpoint set v = 2 where id >= 1",
+		"job-cleanup-retention")
+
+	failed := nonTransactionalDMLCheckpoint{
+		JobID:           rangeCtx.JobID,
+		RangeID:         1,
+		Mode:            "dxf",
+		DMLType:         "update",
+		DBName:          "test",
+		TableID:         rangeCtx.TableID,
+		PhysicalTableID: rangeCtx.PhysicalTableID,
+		HandleKind:      rangeCtx.Descriptor.kind,
+		Status:          nonTransactionalDMLCheckpointFailed,
+		ErrorClass:      "execution",
+		ErrorText:       "permanent failure",
+	}
+	require.NoError(t, writeNonTransactionalDMLCheckpoint(context.Background(), se, failed))
+	taskMeta, err := json.Marshal(&nonTransactionalDMLDXFTaskMeta{
+		JobID:      rangeCtx.JobID,
+		HandleKind: rangeCtx.Descriptor.kind,
+		BatchSize:  rangeCtx.BatchSize,
+	})
+	require.NoError(t, err)
+	cleanup := &nonTransactionalDMLCleanUp{}
+	require.NoError(t, cleanup.CleanUp(context.Background(), &proto.Task{
+		TaskBase: proto.TaskBase{State: proto.TaskStateFailed},
+		Meta:     taskMeta,
+	}))
+
+	checkpoint, err := loadNonTransactionalDMLCheckpoint(context.Background(), se, rangeCtx.JobID, 1, rangeCtx.Descriptor)
+	require.NoError(t, err)
+	require.NotNil(t, checkpoint)
+	require.Equal(t, nonTransactionalDMLCheckpointFailed, checkpoint.Status)
+	require.Equal(t, "permanent failure", checkpoint.ErrorText)
+}
+
 func buildNonTransactionalDMLHandleDescriptorForTest(t *testing.T, se sessiontypes.Session, sql string) (*nonTransactionalDMLHandleDescriptor, error) {
 	ctx := context.Background()
 	stmt := parseNonTransactionalDMLStmtForTest(t, se, sql)
@@ -695,6 +871,28 @@ func parseNonTransactionalDMLStmtForTest(t *testing.T, se sessiontypes.Session, 
 	stmt, ok := stmts[0].(*ast.NonTransactionalDMLStmt)
 	require.True(t, ok)
 	return stmt
+}
+
+func buildNonTransactionalDMLRangeContextForTest(t *testing.T, se sessiontypes.Session, sql string, jobID string) *nonTransactionalDMLRangeContext {
+	ctx := context.Background()
+	stmt := parseNonTransactionalDMLStmtForTest(t, se, sql)
+	nodeW := resolve.NewNodeW(stmt)
+	require.NoError(t, core.Preprocess(ctx, se, nodeW))
+	tableName, _, shardColumnInfo, tableSources, err := buildSelectSQL(stmt, nodeW.GetResolveContext(), se)
+	require.NoError(t, err)
+	desc, err := buildNonTransactionalDMLHandleDescriptor(se, stmt, tableName, shardColumnInfo, tableSources)
+	require.NoError(t, err)
+	rangeCtx, err := buildNonTransactionalDMLRangeContext(stmt, se, nodeW.GetResolveContext(), tableName, desc, tableSources)
+	require.NoError(t, err)
+	rangeCtx.JobID = jobID
+	return rangeCtx
+}
+
+func requireScalarInt(t *testing.T, se sessiontypes.Session, sql string) int64 {
+	rows, err := sqlexec.ExecSQL(context.Background(), se, sql)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	return rows[0].GetInt64(0)
 }
 
 func restoreNonTransactionalDMLExprForTest(t *testing.T, expr ast.ExprNode) string {

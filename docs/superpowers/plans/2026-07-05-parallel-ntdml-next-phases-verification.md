@@ -40,7 +40,7 @@ Range/DXF integration tests touched by this phase:
 go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransactionalDML(RangeModeIntAndVarchar|DXFModeIntAndVarchar|RangeModeRejectsSessionLocalExpressions|DXFModeRejectsSessionLocalExpressions)' -count=1
 ```
 
-Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 7.615s`.
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 10.026s`.
 
 Broader session focused suite:
 
@@ -50,13 +50,29 @@ go test ./pkg/session -run 'TestNonTransactionalDML(HandleDescriptor|Boundary|Ra
 
 Result: passed, `ok github.com/pingcap/tidb/pkg/session 17.545s`.
 
+Phase 2 checkpoint/retry/cancellation regression suite:
+
+```bash
+go test ./pkg/session -run 'TestNonTransactionalDML(AmbiguousCommitCoveredByCheckpoint|DXFReplayFailedCheckpoints|CanceledChunkPreservesFailedCheckpoint|DXFCleanupPreservesFailedTaskCheckpoints)' -count=1
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session 7.128s`.
+
+Updated broader session focused suite including the Phase 2 regressions:
+
+```bash
+go test ./pkg/session -run 'TestNonTransactionalDML(HandleDescriptor|Boundary|RangeCondition|RangeSelectWhere|RangeWorker|RegionRangePlanning|DXFTaskMeta|DXFWait|SessionContext|Checkpoint|Retry|SessionLocal|AmbiguousCommit|DXFReplay|CanceledChunk|DXFCleanup)' -count=1
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session 20.388s`.
+
 Sysvar focused suite:
 
 ```bash
 go test ./pkg/sessionctx/variable -run 'TestNonTransactionalDML(ExecutionMode|Concurrency)SysVar' -count=1
 ```
 
-Result: passed, `ok github.com/pingcap/tidb/pkg/sessionctx/variable 5.679s`.
+Result: passed, `ok github.com/pingcap/tidb/pkg/sessionctx/variable 4.134s`.
 
 Bootstrap checkpoint focused suite:
 
@@ -64,7 +80,21 @@ Bootstrap checkpoint focused suite:
 go test ./pkg/session/bootstraptest -run 'TestBootstrapNonTransactionalDMLCheckpointTable|TestUpgradeVersion239CreatesNonTransactionalDMLCheckpointTable' -count=1
 ```
 
-Result: passed, `ok github.com/pingcap/tidb/pkg/session/bootstraptest 12.840s`.
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/bootstraptest 11.178s`.
+
+Distributed task and metrics packages:
+
+```bash
+go test ./pkg/disttask/framework/proto -count=1
+go test ./pkg/metrics -count=1
+go test ./pkg/session/metrics -count=1
+```
+
+Result: passed.
+
+- `ok github.com/pingcap/tidb/pkg/disttask/framework/proto 0.314s`
+- `ok github.com/pingcap/tidb/pkg/metrics 0.869s`
+- `? github.com/pingcap/tidb/pkg/session/metrics [no test files]`
 
 Static, dashboard, and image checks:
 
@@ -97,6 +127,16 @@ The system test covered:
 - Prometheus and Grafana datasource queries for the NTDML metrics.
 - Checkpoint cleanup after successful jobs.
 
+Docker DXF reduced large-mode system test:
+
+```bash
+DOCKER_CONFIG=$(mktemp -d) BUILD_TIDB=1 NTDML_LARGE_MODE=1 NTDML_RESTART_ROWS=50000 NTDML_PAYLOAD_BYTES=2048 NTDML_RESTART_SLEEP_SECONDS=0 tests/ntdml/run-dxf-system-test.sh
+```
+
+Result: passed with final output `parallel non-transactional DML DXF system test passed`.
+
+This used the same large-mode code path with locally bounded row and payload overrides. It covered the integer and `VARCHAR(...) COLLATE utf8mb4_bin PRIMARY KEY CLUSTERED` restart/failover workloads with TiKV remaining healthy.
+
 ## Baseline Failure
 
 The full `pkg/session/nontransactionaltest` NTDML regex still fails because an existing failpoint-based serial error-message test does not inject its expected error under the current local test invocation:
@@ -115,14 +155,48 @@ go test -tags intest ./pkg/session/nontransactionaltest -run '^TestNonTransactio
 
 Baseline result: failed with `An error is expected but got nil` at the same serial `INSERT ... SELECT` failpoint assertion. The new range/DXF tests added in this phase pass when run directly.
 
+The handoff-listed storage package command also is not a clean local gate in this checkout:
+
+```bash
+go test ./pkg/disttask/framework/storage -count=1 -timeout=5m
+```
+
+Local result: timed out. An isolated run of `TestTaskTable` prints TiDB's guard message that the package should be tested with `--tags=intest`.
+
+With the intended tag, the package completes quickly but fails unrelated disttask storage assertions:
+
+```bash
+go test -tags intest ./pkg/disttask/framework/storage -count=1 -timeout=10m
+```
+
+Local result: failed in `TestSwitchTaskStepInBatch` and `TestModifyTask`.
+
+The same two failures were reproduced against the base branch `origin/release-8.5-20260608-v8.5.6` in a detached worktree:
+
+```bash
+go test -tags intest ./pkg/disttask/framework/storage -run 'Test(SwitchTaskStepInBatch|ModifyTask)$' -count=1 -timeout=3m
+```
+
+Baseline result: failed with:
+
+- `TestSwitchTaskStepInBatch`: expected duplicate-entry error in chain, got an empty chain.
+- `TestModifyTask`: expected `task changed by other operation` in chain, got an empty chain.
+
 ## Not Yet Run
 
-- `DOCKER_CONFIG=$(mktemp -d) BUILD_TIDB=1 NTDML_LARGE_MODE=1 tests/ntdml/run-dxf-system-test.sh`
 - Broad non-NTDML package suites beyond the focused commands above.
 - Performance comparison for serial versus range versus DXF.
+
+The default full large-mode command was attempted locally:
+
+```bash
+DOCKER_CONFIG=$(mktemp -d) BUILD_TIDB=1 NTDML_LARGE_MODE=1 tests/ntdml/run-dxf-system-test.sh
+```
+
+Local result: interrupted after TiKV exited with Docker status `137` during the large failover workload. The default large-mode settings are `NTDML_RESTART_ROWS=250000` and `NTDML_PAYLOAD_BYTES=4096`, which exceeded this local Docker Desktop environment. The reduced large-mode override above passed.
 
 ## Residual Risks
 
 - The full `nontransactionaltest` package needs the existing `TestNonTransactionalDMLErrorMessage` failpoint issue resolved or excluded by the maintainers' intended test mode before it can be used as a clean gate.
-- Large-mode Docker coverage remains to be run for longer restart windows and larger payloads.
+- Full default large-mode Docker coverage still needs a larger host or CI runner with enough Docker memory for the 250k x 4KB failover workload.
 - The dashboard uses only bounded Prometheus labels already emitted by this branch; it cannot show durable checkpoint-row state until that state is exported as a metric.
