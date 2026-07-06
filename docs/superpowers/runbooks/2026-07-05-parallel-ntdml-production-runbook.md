@@ -215,8 +215,11 @@ LIMIT 20;
 
 ## Job States And Checkpoints
 
-- Completed successful jobs delete their checkpoint rows after the final
-  summary.
+- Completed successful jobs attempt to delete their checkpoint rows after the
+  final summary. If post-success checkpoint cleanup fails, the SQL still
+  returns the successful mutation result, TiDB logs a warning with the job id,
+  mode, DML type, and cleanup error, and `status = 'done'` rows can remain for
+  manual cleanup.
 - Failed jobs retain checkpoint rows with `status = 'failed'`.
 - Canceled jobs retain failed checkpoint rows with `error_class = 'canceled'`
   when cancellation interrupts a chunk.
@@ -227,9 +230,20 @@ LIMIT 20;
 
 Retained rows include the job id, range id, mode, DML type, database, table ids,
 handle kind, range boundaries, checkpoint value, status, retry count, error
-class, error text, scanned rows, affected rows, and timestamps.
+class, error text, scanned rows, affected rows, and timestamps. Successful
+retained rows use `status = 'done'`; failed or canceled diagnostic rows use
+`status = 'failed'`.
 
-## Cleanup Of Failed Checkpoints
+## Cleanup Of Retained Checkpoints
+
+If a successful job reported `all succeeded` but TiDB warned that checkpoint
+cleanup failed, remove the retained successful rows after confirming the job id:
+
+```sql
+DELETE FROM mysql.tidb_nontransactional_dml_checkpoint
+WHERE job_id = 'range-123-456'
+  AND status = 'done';
+```
 
 Do not delete retained rows until the failure is understood and any needed
 diagnostics have been captured. To remove failed checkpoints for a known job:

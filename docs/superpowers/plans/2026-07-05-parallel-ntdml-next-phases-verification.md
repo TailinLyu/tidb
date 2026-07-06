@@ -328,6 +328,65 @@ git diff --check HEAD
 
 Result: passed with `dashboard metric coverage ok`.
 
+## Successful Cleanup Failure Follow-up
+
+The follow-up changed successful range and DXF checkpoint deletion to
+best-effort so a cleanup delete failure cannot mask a completed mutation. The
+targeted checkpoint/result suite passes:
+
+```bash
+go test ./pkg/session -run 'TestNonTransactionalDML(Checkpoint|DXFResults|Cleanup|CanceledChunk|DXFCleanup|RangeModeCleanupFailureReturnsSuccess)' -count=1
+```
+
+Result: passed.
+
+The normal range/DXF integration smoke tests still pass and continue to verify
+successful checkpoint cleanup when no cleanup error is injected:
+
+```bash
+go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransactionalDML(RangeModeIntAndVarchar|DXFModeIntAndVarchar)' -count=1
+```
+
+Result: passed.
+
+Sysvar, bootstrap, and dashboard validation after the cleanup change:
+
+```bash
+go test ./pkg/sessionctx/variable -run 'TestNonTransactionalDML(ExecutionMode|Concurrency)SysVar' -count=1
+go test ./pkg/session/bootstraptest -run 'TestBootstrapNonTransactionalDMLCheckpointTable|TestUpgradeVersion239CreatesNonTransactionalDMLCheckpointTable' -count=1
+python3 -m json.tool pkg/metrics/grafana/non_transactional_dml.json >/dev/null
+go run tools/dashboard-linter/main.go pkg/metrics/grafana/non_transactional_dml.json
+```
+
+Result: passed.
+
+The Grafana dashboard still covers every dedicated NTDML metric family:
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+path = pathlib.Path('pkg/metrics/grafana/non_transactional_dml.json')
+data = json.loads(path.read_text())
+text = json.dumps(data)
+metrics = [
+    'tidb_session_non_transactional_dml_count',
+    'tidb_session_non_transactional_dml_task_total',
+    'tidb_session_non_transactional_dml_chunk_total',
+    'tidb_session_non_transactional_dml_rows_total',
+    'tidb_session_non_transactional_dml_retry_total',
+    'tidb_session_non_transactional_dml_duration_seconds_bucket',
+    'tidb_session_non_transactional_dml_duration_seconds_sum',
+    'tidb_session_non_transactional_dml_duration_seconds_count',
+]
+missing = [metric for metric in metrics if metric not in text]
+if missing:
+    raise SystemExit('missing dashboard metrics: ' + ', '.join(missing))
+print('dashboard covers all NTDML metric families')
+PY
+```
+
+Result: passed with `dashboard covers all NTDML metric families`.
+
 ## Baseline Failure
 
 The full `pkg/session/nontransactionaltest` NTDML regex still fails because an existing failpoint-based serial error-message test does not inject its expected error under the current local test invocation:

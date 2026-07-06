@@ -725,8 +725,9 @@ func TestNonTransactionalDMLDXFResultsDeleteSuccessfulCheckpoints(t *testing.T) 
 	require.NoError(t, writeNonTransactionalDMLCheckpoint(context.Background(), se, done))
 
 	rs, err := buildNonTransactionalDMLDXFResults(context.Background(), se, &nonTransactionalDMLDXFTaskMeta{
-		JobID:  rangeCtx.JobID,
-		Ranges: []nonTransactionalDMLDXFRangeMeta{{RangeID: 1}},
+		JobID:   rangeCtx.JobID,
+		DMLType: rangeCtx.DMLType,
+		Ranges:  []nonTransactionalDMLDXFRangeMeta{{RangeID: 1}},
 	})
 	require.NoError(t, err)
 	require.NoError(t, rs.Close())
@@ -734,6 +735,100 @@ func TestNonTransactionalDMLDXFResultsDeleteSuccessfulCheckpoints(t *testing.T) 
 	loaded, err := loadNonTransactionalDMLCheckpoint(context.Background(), se, rangeCtx.JobID, 1, rangeCtx.Descriptor)
 	require.NoError(t, err)
 	require.Nil(t, loaded)
+}
+
+func TestNonTransactionalDMLRangeModeCleanupFailureReturnsSuccess(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "set @@tidb_nontransactional_dml_execution_mode='range'")
+	MustExec(t, se, "set @@tidb_nontransactional_dml_concurrency=2")
+	MustExec(t, se, "create table t_range_cleanup_failure(id bigint primary key clustered, c int)")
+	MustExec(t, se, "insert into t_range_cleanup_failure values (1, 10), (2, 20), (3, 30), (4, 40)")
+	withNonTransactionalDMLDeleteCheckpointsHook(t,
+		func(context.Context, sessiontypes.Session, string) error {
+			return errors.New("mock non-transactional DML checkpoint cleanup failure")
+		})
+
+	stmt := parseNonTransactionalDMLStmtForTest(t, se,
+		"batch on id limit 2 update t_range_cleanup_failure set c = c + 1 where id >= 1")
+	rs, err := HandleNonTransactionalDML(context.Background(), stmt, se)
+	require.NoError(t, err)
+	simpleRS, ok := rs.(*sqlexec.SimpleRecordSet)
+	require.True(t, ok)
+	require.Equal(t, [][]any{{2, "all succeeded"}}, simpleRS.Rows)
+	require.NoError(t, rs.Close())
+
+	require.Equal(t, int64(4), requireScalarInt(t, se, `
+		select count(*) from t_range_cleanup_failure
+		where (id = 1 and c = 11) or (id = 2 and c = 21) or (id = 3 and c = 31) or (id = 4 and c = 41)`))
+	require.Equal(t, int64(2), requireScalarInt(t, se,
+		"select count(*) from mysql.tidb_nontransactional_dml_checkpoint where status = 'done'"))
+}
+
+func TestNonTransactionalDMLDXFResultsCleanupFailureReturnsSuccess(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_dxf_result_cleanup_failure(id bigint primary key clustered, v int)")
+	rangeCtx := buildNonTransactionalDMLRangeContextForTest(t, se,
+		"batch on id limit 2 update t_dxf_result_cleanup_failure set v = 2 where id >= 1",
+		"job-dxf-result-cleanup-failure")
+
+	done := nonTransactionalDMLCheckpoint{
+		JobID:           rangeCtx.JobID,
+		RangeID:         1,
+		Mode:            "dxf",
+		DMLType:         "update",
+		DBName:          "test",
+		TableID:         rangeCtx.TableID,
+		PhysicalTableID: rangeCtx.PhysicalTableID,
+		HandleKind:      rangeCtx.Descriptor.kind,
+		Status:          nonTransactionalDMLCheckpointDone,
+		Scanned:         2,
+		Affected:        2,
+	}
+	require.NoError(t, writeNonTransactionalDMLCheckpoint(context.Background(), se, done))
+	withNonTransactionalDMLDeleteCheckpointsHook(t,
+		func(context.Context, sessiontypes.Session, string) error {
+			return errors.New("mock non-transactional DML checkpoint cleanup failure")
+		})
+
+	rs, err := buildNonTransactionalDMLDXFResults(context.Background(), se, &nonTransactionalDMLDXFTaskMeta{
+		JobID:   rangeCtx.JobID,
+		DMLType: rangeCtx.DMLType,
+		Ranges:  []nonTransactionalDMLDXFRangeMeta{{RangeID: 1}},
+	})
+	require.NoError(t, err)
+	simpleRS, ok := rs.(*sqlexec.SimpleRecordSet)
+	require.True(t, ok)
+	require.Equal(t, [][]any{{1, "all succeeded"}}, simpleRS.Rows)
+	require.NoError(t, rs.Close())
+
+	loaded, err := loadNonTransactionalDMLCheckpoint(context.Background(), se, rangeCtx.JobID, 1, rangeCtx.Descriptor)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	require.Equal(t, nonTransactionalDMLCheckpointDone, loaded.Status)
+}
+
+func withNonTransactionalDMLDeleteCheckpointsHook(
+	t *testing.T,
+	hook func(context.Context, sessiontypes.Session, string) error,
+) {
+	t.Helper()
+	previous := nonTransactionalDMLDeleteCheckpointsHook
+	nonTransactionalDMLDeleteCheckpointsHook = hook
+	t.Cleanup(func() {
+		nonTransactionalDMLDeleteCheckpointsHook = previous
+	})
 }
 
 func TestNonTransactionalDMLRetryableErrorClassification(t *testing.T) {

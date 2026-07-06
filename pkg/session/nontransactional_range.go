@@ -119,10 +119,12 @@ func handleNonTransactionalDMLByRange(ctx context.Context, stmt *ast.NonTransact
 	if hasFailedNonTransactionalDMLRangeJob(jobs) {
 		return buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
 	}
-	if err := deleteNonTransactionalDMLCheckpoints(ctx, se, rangeCtx.JobID); err != nil {
+	result, err := buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+	if err != nil {
 		return nil, err
 	}
-	return buildExecuteResults(ctx, jobs, se.GetSessionVars().BatchSize.MaxChunkSize, se.GetSessionVars().EnableRedactLog)
+	cleanupSuccessfulNonTransactionalDMLCheckpoints(ctx, se, rangeCtx.JobID, session_metrics.NonTransactionalDMLModeRange, rangeCtx.DMLType)
+	return result, nil
 }
 
 func hasFailedNonTransactionalDMLRangeJob(jobs []job) bool {
@@ -132,6 +134,18 @@ func hasFailedNonTransactionalDMLRangeJob(jobs []job) bool {
 		}
 	}
 	return false
+}
+
+func cleanupSuccessfulNonTransactionalDMLCheckpoints(ctx context.Context, se sessiontypes.Session, jobID, mode, dmlType string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nonTransactionalDMLCheckpointWriteTimeout)
+	defer cancel()
+	if err := deleteNonTransactionalDMLCheckpoints(cleanupCtx, se, jobID); err != nil {
+		logutil.Logger(ctx).Warn("failed to clean up successful non-transactional DML checkpoints",
+			zap.String("job-id", jobID),
+			zap.String("mode", mode),
+			zap.String("type", dmlType),
+			zap.Error(err))
+	}
 }
 
 func checkNonTransactionalDMLRangeModeStatement(stmt *ast.NonTransactionalDMLStmt, tableSources []*ast.TableSource) error {

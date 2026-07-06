@@ -32,6 +32,8 @@ import (
 
 const nonTransactionalDMLCheckpointTableName = "tidb_nontransactional_dml_checkpoint"
 
+var nonTransactionalDMLDeleteCheckpointsHook func(context.Context, sessiontypes.Session, string) error
+
 const createNonTransactionalDMLCheckpointTableSQL = `CREATE TABLE IF NOT EXISTS mysql.tidb_nontransactional_dml_checkpoint (
 	job_id VARCHAR(128) NOT NULL,
 	range_id BIGINT(64) NOT NULL,
@@ -204,6 +206,11 @@ func summarizeNonTransactionalDMLCheckpoints(ctx context.Context, se sessiontype
 }
 
 func deleteNonTransactionalDMLCheckpoints(ctx context.Context, se sessiontypes.Session, jobID string) error {
+	if nonTransactionalDMLDeleteCheckpointsHook != nil {
+		if err := nonTransactionalDMLDeleteCheckpointsHook(ctx, se, jobID); err != nil {
+			return err
+		}
+	}
 	ctx = kv.WithInternalSourceType(ctx, kv.InternalTxnOthers)
 	_, err := sqlexec.ExecSQL(ctx, se, `
 		DELETE FROM mysql.tidb_nontransactional_dml_checkpoint

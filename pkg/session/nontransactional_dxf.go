@@ -292,9 +292,7 @@ func buildNonTransactionalDMLDXFResults(ctx context.Context, se sessiontypes.Ses
 	if err != nil {
 		return nil, err
 	}
-	if err := deleteNonTransactionalDMLCheckpoints(ctx, se, taskMeta.JobID); err != nil {
-		return nil, err
-	}
+	cleanupSuccessfulNonTransactionalDMLCheckpoints(ctx, se, taskMeta.JobID, session_metrics.NonTransactionalDMLModeDXF, taskMeta.DMLType)
 	return result, nil
 }
 
