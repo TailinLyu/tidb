@@ -100,6 +100,101 @@ Take non-transactional `DELETE` for example, only the `WHERE` clause in the dele
 
 There may be other constraints or incompatibilities. They will be demonstrated in the official documentation of the feature. 
 
+### Parallel Execution Modes
+
+TiDB keeps the existing serial non-transactional DML path as the default. Two
+explicit opt-in modes are available for production cleanup jobs that need
+bounded transactions and parallel workers:
+
+- `tidb_nontransactional_dml_execution_mode = 'range'` runs local TiDB worker
+  sessions on the submitting node.
+- `tidb_nontransactional_dml_execution_mode = 'dxf'` submits the job to the
+  distributed task framework.
+- `tidb_nontransactional_dml_concurrency` limits local range workers or the DXF
+  task concurrency.
+
+Parallel modes support single-table `DELETE` and `UPDATE` only. The batch
+`LIMIT` is the maximum number of observed handles per chunk transaction. The
+original predicate is rechecked in every mutation statement, and the handle
+range predicate is added to bound the transaction.
+
+Supported chunk handles:
+
+- `_tidb_rowid` on tables without a clustered primary key.
+- A single signed integer clustered primary key.
+- A single-column clustered primary key using `char` or `varchar` with binary
+  collation.
+- A single-column clustered primary key using `binary` or `varbinary`.
+
+Parallel modes reject unsupported shapes instead of silently falling back to
+serial execution. Rejected shapes include partitioned tables, composite
+clustered primary keys, unsigned integer clustered primary keys, non-binary
+string collations, prefix primary keys, secondary-index shard columns,
+multi-table `DELETE` or `UPDATE`, `INSERT ... SELECT`, dry-run statements, and
+statements that update the chunk handle column. Statements containing user
+variables, system variable references, or session-local functions such as
+`connection_id()`, `last_insert_id()`, `current_user()`,
+`current_resource_group()`, `database()`, or `row_count()` are also rejected so
+parallel workers never evaluate session-local state independently.
+
+The range planner uses TiKV record-region boundaries only as coarse scheduling
+hints. Workers advance by scanning real handle values with `ORDER BY handle`
+and `LIMIT`, then mutating through the last observed handle. This avoids a full
+pre-scan and avoids synthetic midpoint generation for strings.
+
+Progress is durable in `mysql.tidb_nontransactional_dml_checkpoint`. Successful
+jobs attempt best-effort checkpoint deletion after producing the final summary;
+a post-success cleanup failure is logged with the job id, mode, DML type, and
+error, but it does not turn the completed mutation into a user-visible SQL
+failure. Retained successful rows have `status = 'done'` and can be removed
+manually after confirming the job result. Failed or canceled jobs retain
+checkpoint rows with bounded diagnostics. Failed checkpoint `error_class` values
+distinguish retryable, execution, and canceled outcomes. DXF task metadata uses
+task keys of the form `ntdml/<job-id>` and stores redacted display SQL for logs;
+metric labels never include raw SQL, predicates, literals, users, or range
+values.
+
+Parallel non-transactional DML does not provide global atomicity across chunks.
+`DELETE` and idempotent `UPDATE` statements are safe first-class use cases.
+Non-idempotent updates such as `SET c = c + 1` can be retried after worker
+failure, TiDB restart, or ambiguous commit handling, so users must not infer
+exactly-once semantics across the whole job.
+
+Operators can observe DXF jobs in `mysql.tidb_global_task` and
+`mysql.tidb_global_task_history` where `type = 'NonTransactionalDML'`, and can
+identify active jobs by the `ntdml/<job-id>` task key. Canceling the submitting
+SQL context requests DXF task cancellation. Framework-level cancel, pause, and
+resume operations use the same task key when invoked by internal operators.
+Prometheus metrics expose bounded labels for statement adoption, task lifecycle,
+chunk results, scanned and affected rows, retries, and duration histograms. The
+published Grafana dashboard is `pkg/metrics/grafana/non_transactional_dml.json`.
+For production operation details, use
+`docs/superpowers/runbooks/2026-07-05-parallel-ntdml-production-runbook.md`.
+
+Useful operator queries:
+
+```sql
+SELECT id, task_key, state, step, concurrency, create_time, start_time,
+       state_update_time, end_time
+FROM mysql.tidb_global_task
+WHERE type = 'NonTransactionalDML'
+ORDER BY id DESC;
+
+SELECT id, task_key, state, step, concurrency, create_time, start_time,
+       state_update_time, end_time
+FROM mysql.tidb_global_task_history
+WHERE type = 'NonTransactionalDML'
+ORDER BY id DESC
+LIMIT 20;
+
+SELECT job_id, range_id, mode, dml_type, db_name, table_id,
+       handle_kind, status, retry_count, error_class, error_text,
+       scanned, affected, updated_at, finished_at
+FROM mysql.tidb_nontransactional_dml_checkpoint
+ORDER BY updated_at DESC
+LIMIT 20;
+```
+
 ## Test Design
 
 ### Functional Tests
@@ -142,6 +237,19 @@ Benchmark the delete performance compared with a single normal delete statement:
 1. BATCH ON a unique index
 2. BATCH ON _tidb_rowid or an int PK
 3. BATCH ON a clustered index
+
+This branch also provides an optional Docker-based smoke benchmark:
+
+```bash
+DOCKER_CONFIG=$(mktemp -d) BUILD_TIDB=1 tests/ntdml/run-performance-smoke.sh
+```
+
+The script stands up PD, TiKV, and two TiDB nodes, then prints CSV timings for
+serial, range, and DXF `UPDATE` workloads over signed integer,
+`VARCHAR(...) COLLATE utf8mb4_bin`, and `VARBINARY` clustered primary keys. The
+default sweep uses concurrency values `1 2 4 8 16`; row count, payload size,
+batch size, handle types, and concurrency values are configurable through
+`NTDML_PERF_*` environment variables.
 
 ## Impacts & Risks
 

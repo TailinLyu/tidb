@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/disttask/framework/scheduler"
+	dxftestutil "github.com/pingcap/tidb/pkg/disttask/framework/testutil"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,6 +62,188 @@ func TestNonTransactionalDMLSharding(t *testing.T) {
 		"create table t(a varchar(30), b int, unique key(a))",
 	}
 	testSharding(tables, tk, "varchar(30)")
+}
+
+func TestNonTransactionalDMLRangeModeIntAndVarchar(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='range'")
+	tk.MustExec("set @@tidb_nontransactional_dml_concurrency=2")
+
+	tk.MustExec("create table t_range_int(id bigint primary key clustered, v int)")
+	for i := -2; i < 8; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_range_int values (%d, %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 3 update t_range_int set v = v + 10 where id >= 0").
+		Check(testkit.Rows("3 all succeeded"))
+	tk.MustQuery("select sum(v) from t_range_int where id >= 0").Check(testkit.Rows("108"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
+	tk.MustQuery("batch on id limit 4 delete from t_range_int where id < 4").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select group_concat(id order by id) from t_range_int").Check(testkit.Rows("4,5,6,7"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
+
+	tk.MustExec("create table t_range_nonidempotent(id bigint primary key clustered, c int)")
+	tk.MustExec("insert into t_range_nonidempotent values (1, 10), (2, 10), (3, 10), (4, 10)")
+	tk.MustQuery("batch on id limit 2 update t_range_nonidempotent set c = c + 1 where id >= 1").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select sum(c) from t_range_nonidempotent").Check(testkit.Rows("44"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
+
+	tk.MustExec("create table t_range_varchar(id varchar(32) collate utf8mb4_bin primary key clustered, v int)")
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_range_varchar values ('k%02d', %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 4 update t_range_varchar set v = v * 2 where id >= 'k03'").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select sum(v) from t_range_varchar where id >= 'k03'").Check(testkit.Rows("84"))
+	tk.MustQuery("batch on id limit 3 delete from t_range_varchar where id >= 'k04' and id < 'k09'").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select group_concat(id order by id) from t_range_varchar").Check(testkit.Rows("k00,k01,k02,k03,k09"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
+
+	tk.MustExec("create table t_range_varbinary(id varbinary(32) primary key clustered, v int)")
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_range_varbinary values ('vb:%04d', %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 4 update t_range_varbinary set v = 55 where id >= 'vb:0003'").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select count(*) from t_range_varbinary where id >= 'vb:0003' and v = 55").Check(testkit.Rows("7"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
+
+	tk.MustExec("create table t_range_binary(id binary(8) primary key clustered, v int)")
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_range_binary values ('bn%06d', %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 4 update t_range_binary set v = 66 where id >= 'bn000003'").
+		Check(testkit.Rows("2 all succeeded"))
+	tk.MustQuery("select count(*) from t_range_binary where id >= 'bn000003' and v = 66").Check(testkit.Rows("7"))
+	tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Check(testkit.Rows("0"))
+}
+
+func TestNonTransactionalDMLRangeModeRejectsUnsupportedShapes(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='range'")
+
+	tk.MustExec("create table t_range_reject_unsigned(id bigint unsigned primary key clustered, v int)")
+	err := tk.ExecToErr("batch on id limit 2 delete from t_range_reject_unsigned")
+	require.ErrorContains(t, err, "doesn't support unsigned integer clustered primary keys")
+
+	tk.MustExec("create table t_range_reject_insert(id bigint primary key clustered, v int)")
+	err = tk.ExecToErr("batch on id limit 2 insert into t_range_reject_insert select * from t_range_reject_insert")
+	require.ErrorContains(t, err, "range mode supports DELETE and UPDATE only")
+
+	tk.MustExec("create table t_range_reject_join(id bigint primary key clustered, v int)")
+	err = tk.ExecToErr("batch on id limit 2 update t_range_reject_insert join t_range_reject_join using(id) set t_range_reject_insert.v = 1")
+	require.ErrorContains(t, err, "range mode supports single-table statements only")
+}
+
+func TestNonTransactionalDMLRangeModeRejectsSessionLocalExpressions(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='range'")
+	tk.MustExec("create table t_range_session_local(id bigint primary key clustered, v bigint)")
+	tk.MustExec("insert into t_range_session_local values (1, 1), (2, 2)")
+	tk.MustExec("set @upper_bound = 2")
+
+	cases := []string{
+		"batch on id limit 1 update t_range_session_local set v = v + 1 where id <= @upper_bound",
+		"batch on id limit 1 update t_range_session_local set v = @@auto_increment_increment where id >= 1",
+		"batch on id limit 1 update t_range_session_local set v = connection_id() where id >= 1",
+		"batch on id limit 1 delete from t_range_session_local where database() = 'test'",
+	}
+	for _, sql := range cases {
+		err := tk.ExecToErr(sql)
+		require.ErrorContains(t, err, "doesn't support user variables, system variable references, or session-local functions")
+	}
+	tk.MustQuery("select id, v from t_range_session_local order by id").Check(testkit.Rows("1 1", "2 2"))
+}
+
+func TestNonTransactionalDMLDXFModeRejectsSessionLocalExpressions(t *testing.T) {
+	dxfCtx := dxftestutil.NewTestDXFContext(t, 2, 4, true)
+	tk := testkit.NewTestKit(t, dxfCtx.Store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='dxf'")
+	tk.MustExec("create table t_dxf_session_local(id bigint primary key clustered, v bigint)")
+	tk.MustExec("insert into t_dxf_session_local values (1, 1), (2, 2)")
+	tk.MustExec("set @upper_bound = 2")
+
+	cases := []string{
+		"batch on id limit 1 update t_dxf_session_local set v = v + 1 where id <= @upper_bound",
+		"batch on id limit 1 update t_dxf_session_local set v = @@auto_increment_increment where id >= 1",
+		"batch on id limit 1 update t_dxf_session_local set v = connection_id() where id >= 1",
+		"batch on id limit 1 delete from t_dxf_session_local where database() = 'test'",
+	}
+	for _, sql := range cases {
+		err := tk.ExecToErr(sql)
+		require.ErrorContains(t, err, "doesn't support user variables, system variable references, or session-local functions")
+	}
+	tk.MustQuery("select id, v from t_dxf_session_local order by id").Check(testkit.Rows("1 1", "2 2"))
+}
+
+func TestNonTransactionalDMLDXFModeIntAndVarchar(t *testing.T) {
+	cleanupIntervalBak := scheduler.DefaultCleanUpInterval
+	scheduler.DefaultCleanUpInterval = 100 * time.Millisecond
+	t.Cleanup(func() {
+		scheduler.DefaultCleanUpInterval = cleanupIntervalBak
+	})
+
+	dxfCtx := dxftestutil.NewTestDXFContext(t, 2, 4, true)
+	tk := testkit.NewTestKit(t, dxfCtx.Store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_nontransactional_dml_execution_mode='dxf'")
+	tk.MustExec("set @@tidb_nontransactional_dml_concurrency=2")
+	taskStartBefore := readPrometheusCounter(t, metrics.NonTransactionalDMLTaskCounter.WithLabelValues("dxf", "update", "start"))
+	chunkOKBefore := readPrometheusCounter(t, metrics.NonTransactionalDMLChunkCounter.WithLabelValues("dxf", "update", "ok"))
+	affectedBefore := readPrometheusCounter(t, metrics.NonTransactionalDMLRowsCounter.WithLabelValues("dxf", "update", "affected"))
+
+	tk.MustExec("create table t_dxf_int(id bigint primary key clustered, v int)")
+	for i := -2; i < 8; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_dxf_int values (%d, %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 3 update t_dxf_int set v = 100 where id >= 0").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select count(*) from t_dxf_int where id >= 0 and v = 100").Check(testkit.Rows("8"))
+	tk.MustQuery("batch on id limit 4 delete from t_dxf_int where id < 4").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select group_concat(id order by id) from t_dxf_int").Check(testkit.Rows("4,5,6,7"))
+
+	tk.MustExec("create table t_dxf_varchar(id varchar(64) collate utf8mb4_bin primary key clustered, v int)")
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_dxf_varchar values ('v1:pacer_largepayload%04d', %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 3 update t_dxf_varchar set v = 42 where id >= 'v1:pacer_largepayload0003'").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select count(*) from t_dxf_varchar where id >= 'v1:pacer_largepayload0003' and v = 42").Check(testkit.Rows("7"))
+	tk.MustQuery("batch on id limit 2 delete from t_dxf_varchar where id >= 'v1:pacer_largepayload0004' and id < 'v1:pacer_largepayload0009'").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select group_concat(id order by id separator ',') from t_dxf_varchar").
+		Check(testkit.Rows("v1:pacer_largepayload0000,v1:pacer_largepayload0001,v1:pacer_largepayload0002,v1:pacer_largepayload0003,v1:pacer_largepayload0009"))
+
+	tk.MustExec("create table t_dxf_varbinary(id varbinary(32) primary key clustered, v int)")
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_dxf_varbinary values ('vb:%04d', %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 3 update t_dxf_varbinary set v = 55 where id >= 'vb:0003'").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select count(*) from t_dxf_varbinary where id >= 'vb:0003' and v = 55").Check(testkit.Rows("7"))
+
+	tk.MustExec("create table t_dxf_binary(id binary(8) primary key clustered, v int)")
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t_dxf_binary values ('bn%06d', %d)", i, i))
+	}
+	tk.MustQuery("batch on id limit 3 update t_dxf_binary set v = 66 where id >= 'bn000003'").
+		Check(testkit.Rows("1 all succeeded"))
+	tk.MustQuery("select count(*) from t_dxf_binary where id >= 'bn000003' and v = 66").Check(testkit.Rows("7"))
+
+	requireNonTransactionalDMLCheckpointsCleaned(t, tk, 30*time.Second)
+	require.Greater(t, readPrometheusCounter(t, metrics.NonTransactionalDMLTaskCounter.WithLabelValues("dxf", "update", "start")), taskStartBefore)
+	require.Greater(t, readPrometheusCounter(t, metrics.NonTransactionalDMLChunkCounter.WithLabelValues("dxf", "update", "ok")), chunkOKBefore)
+	require.Greater(t, readPrometheusCounter(t, metrics.NonTransactionalDMLRowsCounter.WithLabelValues("dxf", "update", "affected")), affectedBefore)
 }
 
 func testSharding(tables []string, tk *testkit.TestKit, tp string) {
@@ -122,6 +306,29 @@ func testSharding(tables []string, tk *testkit.TestKit, tp string) {
 			tk.MustQuery("select count(*) from t").Check(testkit.Rows("0"))
 		}
 	}
+}
+
+func readPrometheusCounter(t *testing.T, counter prometheus.Counter) float64 {
+	var metric dto.Metric
+	require.NoError(t, counter.Write(&metric))
+	return metric.Counter.GetValue()
+}
+
+func requireNonTransactionalDMLCheckpointsCleaned(t *testing.T, tk *testkit.TestKit, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		rows := tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Rows()
+		if rows[0][0].(string) == "0" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	remaining := tk.MustQuery(`
+		SELECT job_id, range_id, mode, dml_type, status, error_class, scanned, affected
+		FROM mysql.tidb_nontransactional_dml_checkpoint
+		ORDER BY job_id, range_id`).Rows()
+	t.Fatalf("remaining non-transactional DML checkpoints after %s: %v", timeout, remaining)
 }
 
 func TestNonTransactionalDMLErrorMessage(t *testing.T) {
