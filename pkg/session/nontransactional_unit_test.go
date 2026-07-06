@@ -87,11 +87,18 @@ func TestNonTransactionalDMLHandleDescriptorSupportedShapes(t *testing.T) {
 			kind:       nonTransactionalDMLHandleCommonBinary,
 			columnName: "id",
 		},
+		{
+			name:       "fixed binary common handle",
+			createSQL:  "create table t_binary(id binary(8) primary key clustered, b int)",
+			stmtSQL:    "batch on id limit 2 update t_binary set b = 10 where id >= 'bn000001'",
+			kind:       nonTransactionalDMLHandleCommonBinary,
+			columnName: "id",
+		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			MustExec(t, se, "drop table if exists t_rowid, t_int, t_varchar, t_varbinary")
+			MustExec(t, se, "drop table if exists t_rowid, t_int, t_varchar, t_varbinary, t_binary")
 			MustExec(t, se, tt.createSQL)
 
 			desc, err := buildNonTransactionalDMLHandleDescriptorForTest(t, se, tt.stmtSQL)
@@ -160,6 +167,47 @@ func TestNonTransactionalDMLHandleDescriptorRejectedShapes(t *testing.T) {
 	}
 }
 
+func TestNonTransactionalDMLSessionLocalExpressionRejected(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_session_local(id bigint primary key clustered, v bigint)")
+
+	cases := []struct {
+		name    string
+		stmtSQL string
+	}{
+		{
+			name:    "user variable in predicate",
+			stmtSQL: "batch on id limit 2 update t_session_local set v = v + 1 where id <= @upper_bound",
+		},
+		{
+			name:    "system variable in assignment",
+			stmtSQL: "batch on id limit 2 update t_session_local set v = @@auto_increment_increment where id >= 1",
+		},
+		{
+			name:    "session local function in assignment",
+			stmtSQL: "batch on id limit 2 update t_session_local set v = connection_id() where id >= 1",
+		},
+		{
+			name:    "session local function in predicate",
+			stmtSQL: "batch on id limit 2 delete from t_session_local where database() = 'test'",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt := parseNonTransactionalDMLStmtForTest(t, se, tt.stmtSQL)
+			err := checkNonTransactionalDMLRangeModeStatement(stmt, []*ast.TableSource{{}})
+			require.ErrorContains(t, err, "doesn't support user variables, system variable references, or session-local functions")
+		})
+	}
+}
+
 func TestNonTransactionalDMLBoundaryEncodeDecode(t *testing.T) {
 	store, dom := CreateStoreAndBootstrap(t)
 	t.Cleanup(func() {
@@ -201,6 +249,15 @@ func TestNonTransactionalDMLBoundaryEncodeDecode(t *testing.T) {
 			value:     types.NewBytesDatum([]byte("v1:\x00bytes")),
 			check: func(t *testing.T, got types.Datum) {
 				require.Equal(t, []byte("v1:\x00bytes"), got.GetBytes())
+			},
+		},
+		{
+			name:      "fixed binary common handle",
+			createSQL: "create table t_boundary(id binary(8) primary key clustered, b int)",
+			stmtSQL:   "batch on id limit 2 delete from t_boundary",
+			value:     types.NewBytesDatum([]byte("bn000001")),
+			check: func(t *testing.T, got types.Datum) {
+				require.Equal(t, []byte("bn000001"), got.GetBytes())
 			},
 		},
 	}

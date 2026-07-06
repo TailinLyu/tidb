@@ -158,7 +158,61 @@ func checkNonTransactionalDMLRangeModeStatementShape(stmt *ast.NonTransactionalD
 	if len(tableSources) != 1 {
 		return errors.New("Non-transactional DML range mode supports single-table statements only")
 	}
+	if containsNonTransactionalDMLSessionLocalState(stmt.DMLStmt) {
+		return errors.New("Non-transactional DML parallel mode doesn't support user variables, system variable references, or session-local functions")
+	}
 	return nil
+}
+
+type nonTransactionalDMLSessionLocalStateVisitor struct {
+	found bool
+}
+
+func (v *nonTransactionalDMLSessionLocalStateVisitor) Enter(n ast.Node) (ast.Node, bool) {
+	switch node := n.(type) {
+	case *ast.VariableExpr:
+		v.found = true
+		return n, true
+	case *ast.FuncCallExpr:
+		if isNonTransactionalDMLSessionLocalFunction(node.FnName.L) {
+			v.found = true
+			return n, true
+		}
+	}
+	return n, false
+}
+
+func (v *nonTransactionalDMLSessionLocalStateVisitor) Leave(n ast.Node) (ast.Node, bool) {
+	return n, !v.found
+}
+
+func containsNonTransactionalDMLSessionLocalState(node ast.Node) bool {
+	if node == nil {
+		return false
+	}
+	visitor := &nonTransactionalDMLSessionLocalStateVisitor{}
+	node.Accept(visitor)
+	return visitor.found
+}
+
+func isNonTransactionalDMLSessionLocalFunction(name string) bool {
+	switch name {
+	case ast.ConnectionID,
+		ast.CurrentResourceGroup,
+		ast.CurrentRole,
+		ast.CurrentUser,
+		ast.Database,
+		ast.FoundRows,
+		ast.LastInsertId,
+		ast.RowCount,
+		ast.Schema,
+		ast.SessionUser,
+		ast.SystemUser,
+		ast.User:
+		return true
+	default:
+		return false
+	}
 }
 
 func buildNonTransactionalDMLRangeContext(stmt *ast.NonTransactionalDMLStmt, se sessiontypes.Session, resolveCtx *resolve.Context,

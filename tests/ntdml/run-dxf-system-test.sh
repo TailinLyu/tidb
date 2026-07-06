@@ -20,8 +20,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK_DIR="${WORK_DIR:-$(mktemp -d -t tidb-ntdml-dxf.XXXXXX)}"
 PROJECT="${PROJECT:-tidb-ntdml-dxf}"
 TIDB_IMAGE="${TIDB_IMAGE:-tidb-ntdml-test:local}"
-PD_IMAGE="${PD_IMAGE:-pingcap/pd:v8.5.0}"
-TIKV_IMAGE="${TIKV_IMAGE:-pingcap/tikv:v8.5.0}"
+PD_IMAGE="${PD_IMAGE:-pingcap/pd:v8.5.6}"
+TIKV_IMAGE="${TIKV_IMAGE:-pingcap/tikv:v8.5.6}"
 MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.0}"
 CURL_IMAGE="${CURL_IMAGE:-curlimages/curl:8.8.0}"
 PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-prom/prometheus:v2.53.0}"
@@ -408,8 +408,8 @@ ensure_failover_running() {
 	label="$1"
 	if ! kill -0 "$failover_pid" 2>/dev/null; then
 		echo "failover workload finished before ${label}" >&2
-		cat "$WORK_DIR/failover.out" >&2 || true
-		cat "$WORK_DIR/failover.err" >&2 || true
+		cat "$failover_out" >&2 || true
+		cat "$failover_err" >&2 || true
 		exit 1
 	fi
 }
@@ -493,6 +493,46 @@ sql < "$WORK_DIR/varchar.sql"
 
 wait_checkpoint_cleanup tidb0
 
+{
+	cat <<'SQL'
+USE ntdml_system;
+SET tidb_nontransactional_dml_execution_mode = 'dxf';
+SET tidb_nontransactional_dml_concurrency = 4;
+CREATE TABLE t_varbinary(
+  id VARBINARY(64) PRIMARY KEY CLUSTERED,
+  v INT NOT NULL
+);
+SQL
+	for start in $(seq 0 20 180); do
+		values=()
+		for i in $(seq "$start" $((start + 19))); do
+			key=$(printf "vb:%04d" "$i")
+			values+=("('$key',$i)")
+		done
+		IFS=,
+		echo "INSERT INTO t_varbinary VALUES ${values[*]};"
+		unset IFS
+	done
+	cat <<'SQL'
+SPLIT TABLE t_varbinary BY
+  ('vb:0050'),
+  ('vb:0100'),
+  ('vb:0150');
+BATCH ON id LIMIT 30 UPDATE t_varbinary
+  SET v = 77
+  WHERE id >= 'vb:0000' AND id < 'vb:0200';
+SELECT IF(COUNT(*) = 200, 'ok', CONCAT('bad_varbinary_count=', COUNT(*))) AS varbinary_rows
+  FROM t_varbinary
+  WHERE v = 77;
+BATCH ON id LIMIT 35 DELETE FROM t_varbinary
+  WHERE id >= 'vb:0040' AND id < 'vb:0160';
+SELECT IF(COUNT(*) = 80, 'ok', CONCAT('bad_varbinary_remaining=', COUNT(*))) AS varbinary_delete_rows FROM t_varbinary;
+SQL
+} > "$WORK_DIR/varbinary.sql"
+sql < "$WORK_DIR/varbinary.sql"
+
+wait_checkpoint_cleanup tidb0
+
 payload="$(printf '%*s' "$NTDML_PAYLOAD_BYTES" '' | tr ' ' 'x')"
 {
 	cat <<'SQL'
@@ -543,7 +583,9 @@ BATCH ON id LIMIT 20 UPDATE t_failover
   WHERE id >= 0 AND SLEEP(${NTDML_RESTART_SLEEP_SECONDS}) = 0;
 SQL
 
-sql < "$WORK_DIR/failover_run.sql" > "$WORK_DIR/failover.out" 2> "$WORK_DIR/failover.err" &
+failover_out="$WORK_DIR/failover.out"
+failover_err="$WORK_DIR/failover.err"
+sql < "$WORK_DIR/failover_run.sql" > "$failover_out" 2> "$failover_err" &
 failover_pid=$!
 
 wait_positive_scalar tidb1 \
@@ -570,6 +612,85 @@ wait_scalar_equals tidb1 \
 	"SELECT COUNT(*) FROM ntdml_system.t_failover WHERE marker='done'" \
 	"$NTDML_RESTART_ROWS" \
 	"DXF completion after submitter/owner loss"
+
+docker start "$(tidb_container tidb0)" >/dev/null
+wait_status tidb0
+wait_sql tidb0
+wait_checkpoint_cleanup tidb1
+
+{
+	cat <<'SQL'
+USE ntdml_system;
+SET tidb_nontransactional_dml_execution_mode = 'dxf';
+SET tidb_nontransactional_dml_concurrency = 4;
+DROP TABLE IF EXISTS t_common_failover;
+CREATE TABLE t_common_failover(
+  id VARCHAR(96) COLLATE utf8mb4_bin PRIMARY KEY CLUSTERED,
+  payload TEXT NOT NULL,
+  marker VARCHAR(16) NOT NULL
+);
+SQL
+	for start in $(seq 0 20 $((NTDML_RESTART_ROWS - 1))); do
+		values=()
+		end=$((start + 19))
+		if (( end >= NTDML_RESTART_ROWS )); then
+			end=$((NTDML_RESTART_ROWS - 1))
+		fi
+		for i in $(seq "$start" "$end"); do
+			key=$(printf "cfail:%08d" "$i")
+			values+=("('$key','$payload','todo')")
+		done
+		IFS=,
+		echo "INSERT INTO t_common_failover VALUES ${values[*]};"
+		unset IFS
+	done
+	split_points=()
+	for divisor in 1 2 3 4 5 6 7; do
+		point=$((NTDML_RESTART_ROWS * divisor / 8))
+		if (( point > 0 && point < NTDML_RESTART_ROWS )); then
+			key=$(printf "cfail:%08d" "$point")
+			split_points+=("('$key')")
+		fi
+	done
+	if (( ${#split_points[@]} > 0 )); then
+		IFS=,
+		echo "SPLIT TABLE t_common_failover BY ${split_points[*]};"
+		unset IFS
+	fi
+} > "$WORK_DIR/common_failover_setup.sql"
+sql < "$WORK_DIR/common_failover_setup.sql"
+
+cat > "$WORK_DIR/common_failover_run.sql" <<SQL
+USE ntdml_system;
+SET tidb_nontransactional_dml_execution_mode = 'dxf';
+SET tidb_nontransactional_dml_concurrency = 4;
+BATCH ON id LIMIT 20 UPDATE t_common_failover
+  SET marker = 'done'
+  WHERE id >= 'cfail:00000000' AND SLEEP(${NTDML_RESTART_SLEEP_SECONDS}) = 0;
+SQL
+
+failover_out="$WORK_DIR/common_failover.out"
+failover_err="$WORK_DIR/common_failover.err"
+sql < "$WORK_DIR/common_failover_run.sql" > "$failover_out" 2> "$failover_err" &
+failover_pid=$!
+
+wait_positive_scalar tidb1 \
+	"SELECT COUNT(*) FROM mysql.tidb_nontransactional_dml_checkpoint WHERE db_name='ntdml_system' AND status='done'" \
+	"common-handle in-flight checkpoint progress" >/dev/null
+
+ensure_failover_running "common-handle restart coverage started"
+docker restart "$(tidb_container tidb1)" >/dev/null
+wait_status tidb1
+wait_sql tidb1
+ensure_failover_running "common-handle restart coverage completed"
+
+docker kill "$(tidb_container tidb0)" >/dev/null
+wait "$failover_pid" >/dev/null 2>&1 || true
+
+wait_scalar_equals tidb1 \
+	"SELECT COUNT(*) FROM ntdml_system.t_common_failover WHERE marker='done'" \
+	"$NTDML_RESTART_ROWS" \
+	"common-handle DXF completion after submitter/owner loss"
 
 docker start "$(tidb_container tidb0)" >/dev/null
 wait_status tidb0

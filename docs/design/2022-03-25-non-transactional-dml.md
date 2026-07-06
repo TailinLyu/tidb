@@ -131,7 +131,11 @@ serial execution. Rejected shapes include partitioned tables, composite
 clustered primary keys, unsigned integer clustered primary keys, non-binary
 string collations, prefix primary keys, secondary-index shard columns,
 multi-table `DELETE` or `UPDATE`, `INSERT ... SELECT`, dry-run statements, and
-statements that update the chunk handle column.
+statements that update the chunk handle column. Statements containing user
+variables, system variable references, or session-local functions such as
+`connection_id()`, `last_insert_id()`, `current_user()`,
+`current_resource_group()`, `database()`, or `row_count()` are also rejected so
+parallel workers never evaluate session-local state independently.
 
 The range planner uses TiKV record-region boundaries only as coarse scheduling
 hints. Workers advance by scanning real handle values with `ORDER BY handle`
@@ -156,6 +160,9 @@ Operators can observe DXF jobs in `mysql.tidb_global_task` and
 identify active jobs by the `ntdml/<job-id>` task key. Canceling the submitting
 SQL context requests DXF task cancellation. Framework-level cancel, pause, and
 resume operations use the same task key when invoked by internal operators.
+Prometheus metrics expose bounded labels for statement adoption, task lifecycle,
+chunk results, scanned and affected rows, retries, and duration histograms. The
+published Grafana dashboard is `pkg/metrics/grafana/non_transactional_dml.json`.
 
 ## Test Design
 

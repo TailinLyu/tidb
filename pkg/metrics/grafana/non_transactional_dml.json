@@ -55,6 +55,7 @@
   "panels": [
     {
       "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Legacy non-transactional DML statement counter by DML type. This includes the serial path and gives the top-level feature adoption rate.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -71,7 +72,11 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -79,16 +84,17 @@
       },
       "targets": [
         {
-          "expr": "sum by (mode, type, result) (rate(tidb_session_non_transactional_dml_task_total[$__rate_interval]))",
-          "legendFormat": "{{mode}} {{type}} {{result}}",
+          "expr": "sum by (type) (rate(tidb_session_non_transactional_dml_count[$__rate_interval]))",
+          "legendFormat": "{{type}}",
           "refId": "A"
         }
       ],
-      "title": "Task Lifecycle Rate",
+      "title": "Statement Rate",
       "type": "timeseries"
     },
     {
       "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Explicit range and DXF task lifecycle events. Start, ok, and error are bounded result labels emitted once per task.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -105,7 +111,130 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, type, result) (rate(tidb_session_non_transactional_dml_task_total[$__rate_interval]))",
+          "legendFormat": "{{mode}} {{type}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Parallel Task Lifecycle Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Failed task completions divided by completed tasks. A non-zero value indicates task-level failure, not per-row DML conflicts that were retried successfully.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, type) (rate(tidb_session_non_transactional_dml_task_total{result=\"error\"}[$__rate_interval])) / sum by (mode, type) (rate(tidb_session_non_transactional_dml_task_total{result=~\"ok|error\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} {{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Task Error Ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Starts minus terminal task results over the visible time range, clamped to zero. This is an operational estimate from counters, not a durable task gauge.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "clamp_min(sum by (mode, type) (increase(tidb_session_non_transactional_dml_task_total{result=\"start\"}[$__range])) - sum by (mode, type) (increase(tidb_session_non_transactional_dml_task_total{result=~\"ok|error\"}[$__range])), 0)",
+          "legendFormat": "{{mode}} {{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent In-Flight Task Estimate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Chunk execution outcomes by mode and DML type. Chunk errors are the first place to look for retry exhaustion or statement-shape bugs that escaped validation.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -123,6 +252,47 @@
     },
     {
       "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Errored chunks divided by terminal chunk results. This separates task-level errors from chunk-level instability.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, type) (rate(tidb_session_non_transactional_dml_chunk_total{result=\"error\"}[$__rate_interval])) / sum by (mode, type) (rate(tidb_session_non_transactional_dml_chunk_total{result=~\"ok|error\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} {{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Chunk Error Ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Rows scanned for chunk boundary discovery and rows affected by the resulting DML chunks.",
       "fieldConfig": {
         "defaults": {
           "unit": "rows/sec"
@@ -133,13 +303,17 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 24
       },
-      "id": 3,
+      "id": 7,
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -152,11 +326,52 @@
           "refId": "A"
         }
       ],
-      "title": "Rows Scanned And Affected",
+      "title": "Rows Scanned And Affected Rate",
       "type": "timeseries"
     },
     {
       "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Approximate chunk selectivity. Values close to one mean scanned handles are mostly affected; lower values usually mean selective predicates or sparse matching rows.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, type) (rate(tidb_session_non_transactional_dml_rows_total{kind=\"affected\"}[$__rate_interval])) / sum by (mode, type) (rate(tidb_session_non_transactional_dml_rows_total{kind=\"scanned\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} {{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Rows Affected Per Scanned Row",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Retry attempts caused by retryable transaction errors such as write conflicts, lock waits, and retryable deadlocks.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -166,14 +381,18 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 8
+        "x": 0,
+        "y": 32
       },
-      "id": 4,
+      "id": 9,
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -191,6 +410,47 @@
     },
     {
       "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Retry attempts normalized by terminal chunk executions. Sustained growth points to contention or insufficient chunk sizing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, type) (rate(tidb_session_non_transactional_dml_retry_total[$__rate_interval])) / sum by (mode, type) (rate(tidb_session_non_transactional_dml_chunk_total{result=~\"ok|error\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} {{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Retries Per Chunk",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Parallel task wall-clock duration percentiles from the task duration histogram.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
@@ -201,13 +461,17 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 16
+        "y": 40
       },
-      "id": 5,
+      "id": 11,
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -215,16 +479,66 @@
       },
       "targets": [
         {
+          "expr": "histogram_quantile(0.50, sum by (le, mode, type, result) (rate(tidb_session_non_transactional_dml_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{mode}} {{type}} {{result}}",
+          "refId": "A"
+        },
+        {
           "expr": "histogram_quantile(0.95, sum by (le, mode, type, result) (rate(tidb_session_non_transactional_dml_duration_seconds_bucket[$__rate_interval])))",
           "legendFormat": "p95 {{mode}} {{type}} {{result}}",
-          "refId": "A"
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, mode, type, result) (rate(tidb_session_non_transactional_dml_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 {{mode}} {{type}} {{result}}",
+          "refId": "C"
         }
       ],
-      "title": "Task Duration P95",
+      "title": "Task Duration Percentiles",
       "type": "timeseries"
     },
     {
       "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Average parallel task wall-clock duration computed from histogram sum and count series.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, type, result) (rate(tidb_session_non_transactional_dml_duration_seconds_sum[$__rate_interval])) / sum by (mode, type, result) (rate(tidb_session_non_transactional_dml_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{mode}} {{type}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Average Task Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_TEST-CLUSTER}",
+      "description": "Rate of task duration observations, useful for confirming histogram emission even when percentile panels are sparse.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -233,15 +547,19 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 24
+        "w": 12,
+        "x": 12,
+        "y": 48
       },
-      "id": 6,
+      "id": 13,
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -249,12 +567,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (type) (rate(tidb_session_non_transactional_dml_count[$__rate_interval]))",
-          "legendFormat": "{{type}}",
+          "expr": "sum by (mode, type, result) (rate(tidb_session_non_transactional_dml_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{mode}} {{type}} {{result}}",
           "refId": "A"
         }
       ],
-      "title": "Statement Count Rate",
+      "title": "Observed Task Duration Samples",
       "type": "timeseries"
     }
   ],
@@ -276,5 +594,5 @@
   "timezone": "",
   "title": "Test-Cluster-TiDB-Non-Transactional-DML",
   "uid": "tidb-non-transactional-dml",
-  "version": 1
+  "version": 2
 }
