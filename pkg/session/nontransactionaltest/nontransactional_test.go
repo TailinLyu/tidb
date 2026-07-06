@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/disttask/framework/scheduler"
 	dxftestutil "github.com/pingcap/tidb/pkg/disttask/framework/testutil"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/testkit"
@@ -178,6 +179,12 @@ func TestNonTransactionalDMLDXFModeRejectsSessionLocalExpressions(t *testing.T) 
 }
 
 func TestNonTransactionalDMLDXFModeIntAndVarchar(t *testing.T) {
+	cleanupIntervalBak := scheduler.DefaultCleanUpInterval
+	scheduler.DefaultCleanUpInterval = 100 * time.Millisecond
+	t.Cleanup(func() {
+		scheduler.DefaultCleanUpInterval = cleanupIntervalBak
+	})
+
 	dxfCtx := dxftestutil.NewTestDXFContext(t, 2, 4, true)
 	tk := testkit.NewTestKit(t, dxfCtx.Store)
 	tk.MustExec("use test")

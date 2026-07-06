@@ -531,6 +531,33 @@ func TestNonTransactionalDMLDXFWaitCancelsTaskOnContextCancel(t *testing.T) {
 	require.Equal(t, proto.TaskStateReverted, task.State)
 }
 
+func TestNonTransactionalDMLDXFModeRequiresTaskManager(t *testing.T) {
+	store, dom := CreateStoreAndBootstrap(t)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+	se := CreateSessionAndSetID(t, store)
+	MustExec(t, se, "use test")
+	MustExec(t, se, "create table t_dxf_unavailable(id bigint primary key clustered, v int)")
+	stmt := parseNonTransactionalDMLStmtForTest(t, se,
+		"batch on id limit 1 update t_dxf_unavailable set v = 1 where id >= 1")
+
+	previousTaskMgr, previousErr := storage.GetTaskManager()
+	storage.SetTaskManager(nil)
+	t.Cleanup(func() {
+		if previousErr == nil {
+			storage.SetTaskManager(previousTaskMgr)
+			return
+		}
+		storage.SetTaskManager(nil)
+	})
+
+	_, err := handleNonTransactionalDMLByDXF(context.Background(), stmt, se, nil, nil, nil, nil)
+	require.ErrorContains(t, err, "Non-transactional DML DXF mode requires distributed task framework")
+	require.ErrorContains(t, err, "task manager is not initialized")
+}
+
 func TestNonTransactionalDMLSessionContextCaptureApply(t *testing.T) {
 	store, dom := CreateStoreAndBootstrap(t)
 	t.Cleanup(func() {

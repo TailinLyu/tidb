@@ -42,6 +42,22 @@ go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransaction
 
 Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 10.026s`.
 
+Updated focused run after stabilizing the DXF checkpoint cleanup wait:
+
+```bash
+go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransactionalDML(RangeModeIntAndVarchar|DXFModeIntAndVarchar|RangeModeRejectsSessionLocalExpressions|DXFModeRejectsSessionLocalExpressions)' -count=1
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 7.758s`.
+
+DXF cleanup stabilization repeat:
+
+```bash
+go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransactionalDMLDXFModeIntAndVarchar' -count=3
+```
+
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 9.751s`.
+
 Broader session focused suite:
 
 ```bash
@@ -61,10 +77,10 @@ Result: passed, `ok github.com/pingcap/tidb/pkg/session 7.128s`.
 Updated broader session focused suite including the Phase 2 regressions:
 
 ```bash
-go test ./pkg/session -run 'TestNonTransactionalDML(HandleDescriptor|Boundary|RangeCondition|RangeSelectWhere|RangeWorker|RegionRangePlanning|DXFTaskMeta|DXFWait|SessionContext|Checkpoint|Retry|SessionLocal|AmbiguousCommit|DXFReplay|CanceledChunk|DXFCleanup)' -count=1
+go test ./pkg/session -run 'TestNonTransactionalDML(HandleDescriptor|Boundary|RangeCondition|RangeSelectWhere|RangeWorker|RegionRangePlanning|DXFTaskMeta|DXFWait|DXFModeRequiresTaskManager|SessionContext|Checkpoint|Retry|SessionLocal|AmbiguousCommit|DXFReplay|CanceledChunk|DXFCleanup)' -count=1
 ```
 
-Result: passed, `ok github.com/pingcap/tidb/pkg/session 20.388s`.
+Result: passed, `ok github.com/pingcap/tidb/pkg/session 21.541s`.
 
 Sysvar focused suite:
 
