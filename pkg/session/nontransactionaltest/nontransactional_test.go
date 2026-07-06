@@ -233,10 +233,7 @@ func TestNonTransactionalDMLDXFModeIntAndVarchar(t *testing.T) {
 		Check(testkit.Rows("1 all succeeded"))
 	tk.MustQuery("select count(*) from t_dxf_binary where id >= 'bn000003' and v = 66").Check(testkit.Rows("7"))
 
-	require.Eventually(t, func() bool {
-		rows := tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Rows()
-		return rows[0][0].(string) == "0"
-	}, 5*time.Second, 100*time.Millisecond)
+	requireNonTransactionalDMLCheckpointsCleaned(t, tk, 30*time.Second)
 	require.Greater(t, readPrometheusCounter(t, metrics.NonTransactionalDMLTaskCounter.WithLabelValues("dxf", "update", "start")), taskStartBefore)
 	require.Greater(t, readPrometheusCounter(t, metrics.NonTransactionalDMLChunkCounter.WithLabelValues("dxf", "update", "ok")), chunkOKBefore)
 	require.Greater(t, readPrometheusCounter(t, metrics.NonTransactionalDMLRowsCounter.WithLabelValues("dxf", "update", "affected")), affectedBefore)
@@ -308,6 +305,23 @@ func readPrometheusCounter(t *testing.T, counter prometheus.Counter) float64 {
 	var metric dto.Metric
 	require.NoError(t, counter.Write(&metric))
 	return metric.Counter.GetValue()
+}
+
+func requireNonTransactionalDMLCheckpointsCleaned(t *testing.T, tk *testkit.TestKit, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		rows := tk.MustQuery("select count(*) from mysql.tidb_nontransactional_dml_checkpoint").Rows()
+		if rows[0][0].(string) == "0" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	remaining := tk.MustQuery(`
+		SELECT job_id, range_id, mode, dml_type, status, error_class, scanned, affected
+		FROM mysql.tidb_nontransactional_dml_checkpoint
+		ORDER BY job_id, range_id`).Rows()
+	t.Fatalf("remaining non-transactional DML checkpoints after %s: %v", timeout, remaining)
 }
 
 func TestNonTransactionalDMLErrorMessage(t *testing.T) {

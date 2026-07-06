@@ -48,7 +48,7 @@ Updated focused run after stabilizing the DXF checkpoint cleanup wait:
 go test -tags intest ./pkg/session/nontransactionaltest -run 'TestNonTransactionalDML(RangeModeIntAndVarchar|DXFModeIntAndVarchar|RangeModeRejectsSessionLocalExpressions|DXFModeRejectsSessionLocalExpressions)' -count=1
 ```
 
-Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 7.758s`.
+Result: passed, `ok github.com/pingcap/tidb/pkg/session/nontransactionaltest 6.517s`.
 
 DXF cleanup stabilization repeat:
 
@@ -80,7 +80,7 @@ Updated broader session focused suite including the Phase 2 regressions:
 go test ./pkg/session -run 'TestNonTransactionalDML(HandleDescriptor|Boundary|RangeCondition|RangeSelectWhere|RangeWorker|RegionRangePlanning|DXFTaskMeta|DXFWait|DXFModeRequiresTaskManager|SessionContext|Checkpoint|Retry|SessionLocal|AmbiguousCommit|DXFReplay|CanceledChunk|DXFCleanup)' -count=1
 ```
 
-Result: passed, `ok github.com/pingcap/tidb/pkg/session 21.541s`.
+Result: passed, `ok github.com/pingcap/tidb/pkg/session 21.490s`.
 
 Sysvar focused suite:
 
@@ -153,6 +153,64 @@ Result: passed with final output `parallel non-transactional DML DXF system test
 
 This used the same large-mode code path with locally bounded row and payload overrides. It covered the integer and `VARCHAR(...) COLLATE utf8mb4_bin PRIMARY KEY CLUSTERED` restart/failover workloads with TiKV remaining healthy.
 
+Phase 4 performance smoke syntax check:
+
+```bash
+bash -n tests/ntdml/run-performance-smoke.sh
+```
+
+Result: passed.
+
+Phase 4 local performance smoke found and then verified a range-mode concurrency bug. Before the fix, this command failed with `t_varbinary_range_2 updated 350 rows, expected 400`, exposing concurrent mutation of the shared range-mode statement AST while chunk SQL was restored. After guarding that mutation and rebuilding the TiDB image, the narrow reproducer passed:
+
+```bash
+DOCKER_CONFIG=$(mktemp -d) BUILD_TIDB=1 NTDML_PERF_ROWS=400 NTDML_PERF_BATCH_SIZE=80 NTDML_PERF_PAYLOAD_BYTES=128 NTDML_PERF_CONCURRENCY_VALUES='2' NTDML_PERF_HANDLE_TYPES='varbinary' tests/ntdml/run-performance-smoke.sh
+```
+
+Result: passed with:
+
+```text
+handle,mode,concurrency,rows,batch_size,payload_bytes,duration_ms,affected_rows
+varbinary,serial,1,400,80,128,1525,400
+varbinary,range,2,400,80,128,1441,400
+varbinary,dxf,2,400,80,128,3549,400
+```
+
+Bounded local performance sweep:
+
+```bash
+DOCKER_CONFIG=$(mktemp -d) NTDML_PERF_ROWS=400 NTDML_PERF_BATCH_SIZE=80 NTDML_PERF_PAYLOAD_BYTES=128 NTDML_PERF_CONCURRENCY_VALUES='1 2 4' NTDML_PERF_HANDLE_TYPES='int varchar varbinary' tests/ntdml/run-performance-smoke.sh
+```
+
+Result: passed with:
+
+```text
+handle,mode,concurrency,rows,batch_size,payload_bytes,duration_ms,affected_rows
+int,serial,1,400,80,128,2020,400
+int,range,1,400,80,128,1978,400
+int,range,2,400,80,128,2035,400
+int,range,4,400,80,128,1961,400
+int,dxf,1,400,80,128,5147,400
+int,dxf,2,400,80,128,5256,400
+int,dxf,4,400,80,128,5097,400
+varchar,serial,1,400,80,128,1911,400
+varchar,range,1,400,80,128,2092,400
+varchar,range,2,400,80,128,2076,400
+varchar,range,4,400,80,128,1993,400
+varchar,dxf,1,400,80,128,5019,400
+varchar,dxf,2,400,80,128,4879,400
+varchar,dxf,4,400,80,128,4981,400
+varbinary,serial,1,400,80,128,1914,400
+varbinary,range,1,400,80,128,1974,400
+varbinary,range,2,400,80,128,1989,400
+varbinary,range,4,400,80,128,2056,400
+varbinary,dxf,1,400,80,128,5346,400
+varbinary,dxf,2,400,80,128,4999,400
+varbinary,dxf,4,400,80,128,5031,400
+```
+
+The smoke validates row counts and successful checkpoint cleanup after every case. On this small local dataset, range mode is similar to serial because setup and chunk overhead dominate; DXF is slower because distributed task framework scheduling dominates. The script defaults to concurrency `1 2 4 8 16` for larger local or CI sweeps.
+
 ## Baseline Failure
 
 The full `pkg/session/nontransactionaltest` NTDML regex still fails because an existing failpoint-based serial error-message test does not inject its expected error under the current local test invocation:
@@ -201,7 +259,7 @@ Baseline result: failed with:
 ## Not Yet Run
 
 - Broad non-NTDML package suites beyond the focused commands above.
-- Performance comparison for serial versus range versus DXF.
+- Resource group throttling behavior under sustained NTDML load.
 
 The default full large-mode command was attempted locally:
 

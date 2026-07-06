@@ -165,6 +165,30 @@ Prometheus metrics expose bounded labels for statement adoption, task lifecycle,
 chunk results, scanned and affected rows, retries, and duration histograms. The
 published Grafana dashboard is `pkg/metrics/grafana/non_transactional_dml.json`.
 
+Useful operator queries:
+
+```sql
+SELECT id, task_key, state, step, concurrency, create_time, start_time,
+       state_update_time, end_time
+FROM mysql.tidb_global_task
+WHERE type = 'NonTransactionalDML'
+ORDER BY id DESC;
+
+SELECT id, task_key, state, step, concurrency, create_time, start_time,
+       state_update_time, end_time
+FROM mysql.tidb_global_task_history
+WHERE type = 'NonTransactionalDML'
+ORDER BY id DESC
+LIMIT 20;
+
+SELECT job_id, range_id, mode, dml_type, db_name, table_id,
+       handle_kind, status, retry_count, error_class, error_text,
+       scanned, affected, updated_at, finished_at
+FROM mysql.tidb_nontransactional_dml_checkpoint
+ORDER BY updated_at DESC
+LIMIT 20;
+```
+
 ## Test Design
 
 ### Functional Tests
@@ -207,6 +231,19 @@ Benchmark the delete performance compared with a single normal delete statement:
 1. BATCH ON a unique index
 2. BATCH ON _tidb_rowid or an int PK
 3. BATCH ON a clustered index
+
+This branch also provides an optional Docker-based smoke benchmark:
+
+```bash
+DOCKER_CONFIG=$(mktemp -d) BUILD_TIDB=1 tests/ntdml/run-performance-smoke.sh
+```
+
+The script stands up PD, TiKV, and two TiDB nodes, then prints CSV timings for
+serial, range, and DXF `UPDATE` workloads over signed integer,
+`VARCHAR(...) COLLATE utf8mb4_bin`, and `VARBINARY` clustered primary keys. The
+default sweep uses concurrency values `1 2 4 8 16`; row count, payload size,
+batch size, handle types, and concurrency values are configurable through
+`NTDML_PERF_*` environment variables.
 
 ## Impacts & Risks
 

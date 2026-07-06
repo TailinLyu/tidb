@@ -53,6 +53,7 @@ const (
 )
 
 type nonTransactionalDMLRangeContext struct {
+	stmtMu            sync.Mutex
 	Stmt              *ast.NonTransactionalDMLStmt
 	Descriptor        *nonTransactionalDMLHandleDescriptor
 	SessionCtx        nonTransactionalDMLSessionContext
@@ -590,6 +591,10 @@ func buildNonTransactionalDMLRangeMutationSQL(rangeCtx *nonTransactionalDMLRange
 			R:  rangeCtx.OriginalCondition,
 		}
 	}
+	// Restoring chunk SQL temporarily swaps the WHERE clause on the parsed DML
+	// statement; local range workers share rangeCtx, so guard that mutation.
+	rangeCtx.stmtMu.Lock()
+	defer rangeCtx.stmtMu.Unlock()
 	originalCondition := rangeCtx.Stmt.DMLStmt.WhereExpr()
 	rangeCtx.Stmt.DMLStmt.SetWhereExpr(condition)
 	defer rangeCtx.Stmt.DMLStmt.SetWhereExpr(originalCondition)
